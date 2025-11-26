@@ -1,0 +1,15 @@
+{
+  "input": "pz`z",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 20,
+    "kind": "stack"
+  },
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 4,
+    "nb_steps": 12,
+    "execution_time": 127
+  }
+}

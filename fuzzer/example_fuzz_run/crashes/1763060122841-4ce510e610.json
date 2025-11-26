@@ -1,0 +1,11 @@
+{
+  "input": "E",
+  "oracle": "return_code",
+  "bug_info": 42,
+  "execution_time": 10,
+  "minimization": {
+    "unminimized_size": 93,
+    "nb_steps": 14,
+    "execution_time": 151
+  }
+}

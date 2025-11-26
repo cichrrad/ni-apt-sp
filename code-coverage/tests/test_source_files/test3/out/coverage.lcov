@@ -1,0 +1,16 @@
+TN:test
+SF:/home/rdk/Projects/ni-apt/apt-2025-cichra/code-coverage/tests/test_source_files/test3/in/main.c
+DA:5,1
+DA:6,1
+DA:8,1
+DA:9,1
+DA:11,1
+LH:5
+LF:5
+end_of_record
+SF:/home/rdk/Projects/ni-apt/apt-2025-cichra/code-coverage/tests/test_source_files/test3/in/math_operations.c
+DA:3,1
+DA:5,1
+LH:2
+LF:2
+end_of_record

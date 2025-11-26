@@ -1,0 +1,502 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Set load path to find our lib/ folder
+$LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
+
+# --- Gems ---
+require 'colorize' # For pretty logs
+require 'io/wait'
+
+# --- Fuzzer Components ---
+require 'config'
+require 'generators/cstring_generator'
+require 'runner/external_runner'
+require 'oracle/chain'
+require 'results/deduplicator'
+require 'results/stats_aggregator'
+require 'results/results_store'
+require 'minimize/ddmin'
+
+# Used to track worker state in the Parent
+WorkerSlot = Struct.new(:pid, :work_w, :stats_r, :busy, :id, keyword_init: true)
+
+# Brain of the operation
+# Orchestrates the Fuzzing Campaign and manages 
+# parallel Minimizer processes
+class CampaignController
+  # Per-run timeout for the target binary.
+  RUN_TIMEOUT_MS = 1000
+
+  # Number of parallel minimizer processes
+  # (These are now real forks, not threads!)
+  MINIMIZER_PROCESSES = 2
+
+  def initialize
+    @config = Config
+    @config.validate!
+    log_startup
+
+    @hard_timeout = @config.timeout
+
+    # --- Components Init ---
+    @generator = Generators::CstringGenerator.new(min_len: 1, max_len: 1024)
+    @runner = Runner::ExternalRunner.new(
+      target_path: @config.fuzzed_program,
+      mode: @config.input_mode,
+      run_timeout_ms: RUN_TIMEOUT_MS
+    )
+    @oracle = Oracle::Chain.new(run_timeout_ms: RUN_TIMEOUT_MS)
+    @deduplicator = Results::Deduplicator.new
+    @stats = Results::StatsAggregator.new(
+      fuzzer_name: @config.fuzzer_name,
+      fuzzed_program: @config.fuzzed_program
+    )
+    @store = Results::ResultsStore.new(root_dir: @config.result_dir)
+
+    # --- State ---
+    @running = true
+    @counter = 0
+    
+    # work waiting for a free worker
+    # cannot be ruby Queue anymore :(
+    @pending_work = [] 
+
+    # Array of WorkerSlot structs
+    @workers = []
+  end
+
+  # Entry point
+  def run
+    # true parallelism (forks) here instead of
+    # fake lying green ruby threads (liars!)
+    spawn_minimizer_workers 
+
+    # do all of this after
+    # so that minimizers dont
+    # inherit sig traps
+    setup_signal_traps
+    spawn_timeout_thread
+    
+    begin
+      run_main_fuzzing_loop
+    ensure
+      stop # Always cleanup PIDs on exit
+    end
+  end
+
+  private
+
+  # ---------------------------------------------------------
+  # Process Management & IPC Setup
+  # ---------------------------------------------------------
+
+  def spawn_minimizer_workers
+    log_info("Forking #{MINIMIZER_PROCESSES} minimizer processes...")
+
+    MINIMIZER_PROCESSES.times do |i|
+      # Create separate pipes for each worker to avoid interleaving issues
+      # Parent -> Child (Work)
+      work_r, work_w = IO.pipe
+      # Child -> Parent (Stats/Events)
+      stats_r, stats_w = IO.pipe
+
+      work_w.binmode
+      stats_w.binmode
+
+      # --- CHILD PROCESS ---
+      pid = fork do
+
+        # shut child up
+        Signal.trap('INT') { exit!(0) }
+        Signal.trap('TERM') { exit!(0) }
+        # Close unused ends
+        work_w.close
+        stats_r.close
+        # Run the worker logic (point of no return)
+        minimizer_worker_loop(i + 1, work_r, stats_w)
+      end
+      # --- END CHILD ---
+
+      # Close unused ends
+      work_r.close
+      stats_w.close
+
+      @workers << WorkerSlot.new(
+        pid: pid,
+        work_w: work_w,
+        stats_r: stats_r,
+        busy: false,
+        id: i + 1
+      )
+    end
+  end
+
+  def stop
+    # Guard clause to prevent double-execution
+    return unless @running
+    
+    puts # pretty newline after ^C
+    log_warn('Stopping fuzz loop and cleaning up...')
+    @running = false
+
+    # Kill workers explicitly
+    @workers.each do |worker|
+      begin
+        Process.kill('TERM', worker.pid)
+      rescue Errno::ESRCH
+        # Already dead, ignore
+      end
+    end
+
+    # try to wait for workers
+    @workers.each do |worker|
+      begin
+        Process.waitpid(worker.pid)
+      rescue Errno::ECHILD, Errno::ESRCH
+        # Already reaped or didn't exist
+      end
+    end
+    
+    # Close pipes
+    @workers.each do |w|
+      w.work_w.close rescue nil
+      w.stats_r.close rescue nil
+    end
+    
+    # final stats
+    shutdown_stats
+  end
+
+  # ---------------------------------------------------------
+  # Main Loop (Parent)
+  # ---------------------------------------------------------
+
+  def run_main_fuzzing_loop
+    log_success('Fuzzer parent process running.')
+    
+    while @running
+      begin
+        # Manage Workers (Check for results, Assign work)
+        process_worker_events
+        distribute_work
+        # Fuzz
+        run_one_iteration
+        @counter += 1
+        log_info("Fuzzed #{@counter} inputs.") if (@counter % 100).zero?
+      rescue StandardError => e
+        log_error("Parent Loop Error: #{e.message}\n#{e.backtrace.join("\n")}")
+        sleep 1
+      end
+    end
+  end
+
+  def run_one_iteration
+    input = @generator.next
+    result = @runner.run(input)
+    classification = @oracle.classify(result, input)
+
+    @stats.record_run(result, classification)
+
+    return if classification.pass?
+    
+    # Deduplicate
+    return unless @deduplicator.add(classification.signature)
+
+    log_new_bug(classification)
+    @stats.record_new_discovery
+    
+    # Queue for minimization
+    @pending_work << [input, result, classification]
+  end
+
+  # ---------------------------------------------------------
+  # Master-Worker Coordination
+  # ---------------------------------------------------------
+
+  # Checks all worker pipes for incoming messages
+  def process_worker_events
+    # Get all readable stats pipes
+    readable_pipes = @workers.map(&:stats_r)
+    
+    # NON-blocking select
+    ready, = IO.select(readable_pipes, nil, nil, 0)
+    return unless ready
+
+    ready.each do |pipe|
+      # Find which worker this pipe belongs to
+      worker = @workers.find { |w| w.stats_r == pipe }
+      next unless worker
+
+      msg = read_ipc_message(pipe)
+      next if msg.nil? # Pipe closed or error
+
+      handle_worker_message(worker, msg)
+    end
+  end
+
+  # Dispatch incoming event to logic
+  def handle_worker_message(worker, msg)
+    case msg[:type]
+    when :minimization_success
+      # Worker finished a job
+      save_worker_result(msg)
+      worker.busy = false # Mark available
+    when :new_bug_found
+      # Worker found a "new" crash while minimizing
+      handle_side_effect_bug(msg)
+      # still busy with original task
+    end
+  end
+
+  # Assigns pending items to free workers
+  def distribute_work
+    return if @pending_work.empty?
+
+    # Find free workers
+    free_workers = @workers.reject(&:busy)
+    
+    free_workers.each do |worker|
+      break if @pending_work.empty?
+      
+      work_item = @pending_work.shift
+      worker.busy = true
+      send_ipc_message(worker.work_w, work_item)
+    end
+  end
+
+  # ---------------------------------------------------------
+  # Parent-Side Handlers
+  # ---------------------------------------------------------
+
+  def save_worker_result(msg)
+    #
+    @store.save_report(
+      classification: msg[:classification],
+      run_result: msg[:run_result],
+      minimized_input: msg[:minimized_input],
+      unminimized_size: msg[:original_size],
+      min_result: msg[:min_stats]
+    )
+    @stats.record_minimization(msg[:min_stats])
+    @stats.record_saved_report
+    
+    log_minimization_done(msg[:classification], msg[:original_size], msg[:minimized_input].bytesize)
+  end
+
+  def handle_side_effect_bug(msg)
+    cls = msg[:classification]
+    # Check deduplicator (Parent's copy is the valid one)
+    if @deduplicator.add(cls.signature)
+      log_new_bug_during_min(cls)
+      @stats.record_new_discovery
+      # Add to work queue
+      @pending_work << [msg[:input], msg[:run_result], cls]
+    end
+  end
+
+  def shutdown_stats
+    log_warn('Shutting down. Saving final statistics...')
+    stats_path = File.join(@config.result_dir, 'statistics.json')
+    @stats.save(stats_path)
+    log_success("Statistics saved to #{stats_path}")
+  end
+
+  # ---------------------------------------------------------
+  # Worker Process Logic (Runs in Child)
+  # ---------------------------------------------------------
+
+  def minimizer_worker_loop(id, pipe_in, pipe_out)
+    $0 = "fuzzer_worker_#{id}" # for better btop :)
+
+    loop do
+      begin
+        # Blocking read - wait for work
+        item = read_ipc_message(pipe_in)
+        break if item.nil? # Parent closed pipe
+
+        input, result, classification = item
+        
+        # Perform Minimization
+        process_failure_in_worker(id, pipe_out, input, result, classification)
+
+      rescue StandardError => e
+        # Print to stderr to avoid messing up parent's pipe logic
+        warn "[Worker #{id}] Error: #{e.message}"
+      end
+    end
+  end
+
+  def process_failure_in_worker(id, pipe_out, input, result, classification)
+    log_info("Worker #{id} minimizing: #{classification.signature.cyan}")
+
+    original_size = input.bytes.size
+    final_input = input.bytes
+    final_result = result
+    min_result = nil
+
+    if @config.minimize_enabled?
+      # create a custom observer that can talk back to parent over pipe
+      observer = create_ipc_bug_observer(classification.signature, pipe_out)
+      
+      min_result = Minimizer::Ddmin.run(
+        input_bytes: input.bytes,
+        bug_observer: observer
+      )
+      
+      final_input = min_result.minimized_input
+      final_result = @runner.run(final_input)
+    end
+
+    # Send success event back to parent
+    event = {
+      type: :minimization_success,
+      classification: classification,
+      run_result: final_result,
+      minimized_input: final_input,
+      original_size: original_size,
+      min_stats: min_result
+    }
+    send_ipc_message(pipe_out, event)
+  end
+
+  def create_ipc_bug_observer(original_sig, pipe_out)
+    lambda do |bytes|
+      run_result = @runner.run(bytes)
+      classification = @oracle.classify(run_result, nil)
+
+      is_original = (classification.signature == original_sig)
+
+      if !classification.pass? && !is_original
+        # Found a diff bug than our target
+        # ==> Send to parent to verify deduplication.
+        event = {
+          type: :new_bug_found,
+          input: FuzzInput.new(bytes: bytes),
+          run_result: run_result,
+          classification: classification
+        }
+        send_ipc_message(pipe_out, event)
+      end
+
+      is_original
+    end
+  end
+
+  # ---------------------------------------------------------
+  # IPC Helpers (Marshal + Length Prefix)
+  # ---------------------------------------------------------
+
+  def send_ipc_message(io, obj)
+    payload = Marshal.dump(obj)
+    # Write 4-byte length header, then payload
+    header = [payload.bytesize].pack('L')
+    io.write(header)
+    io.write(payload)
+  end
+
+  def read_ipc_message(io)
+    # Read 4-byte length header
+    # read(N) returns nil if EOF
+    header = io.read(4)
+    return nil unless header
+
+    size = header.unpack1('L')
+    payload = io.read(size)
+    return nil unless payload
+
+    Marshal.load(payload)
+  rescue EOFError
+    nil
+  end
+
+  # ---------------------------------------------------------
+  # Logging / Helpers
+  # ---------------------------------------------------------
+
+  def setup_signal_traps
+    log_info('Setting up signal traps (Ctrl+C to stop)...')
+    # We raise Interrupt to break the main loop.
+    # The 'ensure' block in the run method will catch this 
+    # and call 'stop' in a safe thread context.
+    Signal.trap('INT') { raise Interrupt }
+    Signal.trap('TERM') { raise Interrupt }
+  end
+
+  def spawn_timeout_thread
+    return unless @hard_timeout&.to_i&.positive?
+    graceful_exit_delay = @hard_timeout.to_i - 10
+    return if graceful_exit_delay <= 0
+
+    log_info("Campaign TIMEOUT set. Graceful stop in #{graceful_exit_delay}s.")
+
+    Thread.new do
+      sleep graceful_exit_delay
+      if @running
+        log_warn('TIMEOUT approaching. Wrapping things up ...')
+        stop
+      end
+    end
+  end
+
+  def log_startup
+    puts '--- Fuzzer Starting (Multi-Process Mode) ---'.bold
+    puts "  Target:    #{@config.fuzzed_program.light_blue}"
+    puts "  Workers:   #{MINIMIZER_PROCESSES.to_s.light_blue}"
+    puts "  Minimize:  #{@config.minimize_enabled?.to_s.light_blue}"
+    puts '-----------------------'
+  end
+
+  def log_new_bug(classification)
+    puts "\n" + '--- NEW FAILURE FOUND! ---'.red.bold
+    puts "  Oracle:    #{classification.oracle.to_s.red}"
+    puts "  Signature: #{classification.signature.red}"
+    puts "  Status:    #{'Queued for minimization.'.yellow}"
+    puts '-----------------------' + "\n"
+  end
+
+  def log_new_bug_during_min(classification)
+    puts '  -> Discovered new bug during minimization!'.magenta
+    puts "     Signature: #{classification.signature.magenta}"
+    puts '     Sent to queue.'.magenta
+  end
+
+  def log_minimization_done(classification, old_size, new_size)
+    puts '--- Minimization Complete ---'.green
+    puts "  Signature: #{classification.signature.cyan}"
+    puts "  Size:      #{old_size} bytes -> #{new_size} bytes".green
+    puts '  Report saved.'.green
+    puts '-----------------------------'
+  end
+
+  def log_info(msg)
+    puts "[INFO] #{msg}".light_black
+  end
+
+  def log_warn(msg)
+    puts "[WARN] #{msg}".yellow
+  end
+
+  def log_error(msg)
+    puts "[ERROR] #{msg}".red
+  end
+
+  def log_success(msg)
+    puts "[OK] #{msg}".green
+  end
+end
+
+# MAIN PROGRAM RUN
+if $PROGRAM_NAME == __FILE__
+  begin
+    controller = CampaignController.new
+    controller.run
+  rescue Interrupt
+    # Catch Ctrl+C here to suppress the stack trace.
+    # The controller.run 'ensure' block has already handled the cleanup!
+    exit(0)
+  rescue StandardError => e
+    puts "[FATAL] #{e.message}".red.bold
+    exit(1)
+  end
+end

@@ -1,0 +1,15 @@
+{
+  "input": "c :SS.=,",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 11,
+    "kind": "stack"
+  },
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 25,
+    "nb_steps": 42,
+    "execution_time": 561
+  }
+}

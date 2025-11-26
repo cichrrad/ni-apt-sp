@@ -1,0 +1,24 @@
+{
+  "fuzzer_name": "fuzzy_wuzzy_39901",
+  "fuzzed_program": "./target_programs/binary/mock",
+  "nb_runs": 2227,
+  "nb_failed_runs": 501,
+  "nb_hanged_runs": 22,
+  "execution_time": {
+    "average": 26.805568028738215,
+    "median": 10.0,
+    "min": 10,
+    "max": 1060
+  },
+  "nb_unique_failures": 6,
+  "minimization": {
+    "before": 6,
+    "avg_steps": 25,
+    "execution_time": {
+      "average": 1391.1666666666667,
+      "median": 517.5,
+      "min": 127,
+      "max": 6397
+    }
+  }
+}

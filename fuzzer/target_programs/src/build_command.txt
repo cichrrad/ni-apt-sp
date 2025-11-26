@@ -1,0 +1,3 @@
+cc -O0 -g -fsanitize=address -fno-omit-frame-pointer src.c -o out
+
+for file in *.c; do cc -O0 -g -fsanitize=address -fno-omit-frame-pointer "$file" -o "../binary/${file%.c}"; done

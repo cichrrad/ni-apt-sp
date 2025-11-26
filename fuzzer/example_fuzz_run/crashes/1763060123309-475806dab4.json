@@ -1,0 +1,15 @@
+{
+  "input": "S}  ",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 41,
+    "kind": "heap"
+  },
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 86,
+    "nb_steps": 28,
+    "execution_time": 474
+  }
+}

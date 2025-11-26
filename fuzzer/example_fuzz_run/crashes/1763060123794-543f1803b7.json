@@ -1,0 +1,15 @@
+{
+  "input": "H)MO@Sd[",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 30,
+    "kind": "heap"
+  },
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 47,
+    "nb_steps": 46,
+    "execution_time": 637
+  }
+}
