@@ -18,11 +18,26 @@ require 'results/stats_aggregator'
 require 'results/results_store'
 require 'minimize/ddmin'
 
+# task 1 imports
+COV_LIB = File.expand_path('../../code-coverage/src', __dir__)
+$LOAD_PATH.unshift(COV_LIB)
+
+# Load task 1
+begin
+  require 'FileModel'
+  require 'Analyzer'
+  require 'Instrumentor'
+  require 'tree_sitter'
+  require 'tree_stand'
+rescue LoadError
+  # bad practice
+end
+
 # Used to track worker state in the Parent
 WorkerSlot = Struct.new(:pid, :work_w, :stats_r, :busy, :id, keyword_init: true)
 
 # Brain of the operation
-# Orchestrates the Fuzzing Campaign and manages 
+# Orchestrates the Fuzzing Campaign and manages
 # parallel Minimizer processes
 class CampaignController
   # Per-run timeout for the target binary.
@@ -35,6 +50,16 @@ class CampaignController
   def initialize
     @config = Config
     @config.validate!
+
+    @shm_config = nil # Default Blackbox
+
+    # TASK 3 : Check if we need to compile
+    if File.directory?(@config.fuzzed_program)
+      compile_target(@config.fuzzed_program)
+    else
+      @target_bin = @config.fuzzed_program
+    end
+
     log_startup
 
     @hard_timeout = @config.timeout
@@ -42,9 +67,10 @@ class CampaignController
     # --- Components Init ---
     @generator = Generators::CstringGenerator.new(min_len: 1, max_len: 1024)
     @runner = Runner::ExternalRunner.new(
-      target_path: @config.fuzzed_program,
+      target_path: @target_bin,
       mode: @config.input_mode,
-      run_timeout_ms: RUN_TIMEOUT_MS
+      run_timeout_ms: RUN_TIMEOUT_MS,
+      shm_config: @shm_config
     )
     @oracle = Oracle::Chain.new(run_timeout_ms: RUN_TIMEOUT_MS)
     @deduplicator = Results::Deduplicator.new
@@ -57,10 +83,10 @@ class CampaignController
     # --- State ---
     @running = true
     @counter = 0
-    
+
     # work waiting for a free worker
     # cannot be ruby Queue anymore :(
-    @pending_work = [] 
+    @pending_work = []
 
     # Array of WorkerSlot structs
     @workers = []
@@ -70,14 +96,14 @@ class CampaignController
   def run
     # true parallelism (forks) here instead of
     # fake lying green ruby threads (liars!)
-    spawn_minimizer_workers 
+    spawn_minimizer_workers
 
     # do all of this after
     # so that minimizers dont
     # inherit sig traps
     setup_signal_traps
     spawn_timeout_thread
-    
+
     begin
       run_main_fuzzing_loop
     ensure
@@ -86,6 +112,99 @@ class CampaignController
   end
 
   private
+
+  # ---------------------------------------------------------
+  # TASK 3 PROGRAM COMPILATION & SHARED MEM SETUP
+  # ---------------------------------------------------------
+
+  def compile_target(source_dir)
+    source_dir = File.expand_path(source_dir)
+
+    log_info "Greybox Mode: Instrumenting source from #{source_dir}..."
+
+    # Setup TreeStand
+    TreeStand.configure { config.parser_path = '.' }
+    parser = TreeStand::Parser.new('c')
+    analyzer = Analyzer.new
+    inst = Instrumentor.new
+
+    # Analyze (SORTED for Determinism in shared mem layout !!!)
+    files = Dir.glob(File.join(source_dir, '**', '*.c')).sort
+    file_models = []
+    file_plans = []
+    total_slots = 0
+
+    files.each do |p|
+      src = File.binread(p)
+      fm = FileModel.new(path: p, src: src, parser: parser)
+      plan = analyzer.analyze(fm)
+      file_models << fm
+      file_plans << plan
+      total_slots += (plan.nlines + 1)
+    end
+
+    inst.plan_edits(file_models: file_models, file_plans: file_plans)
+    results = inst.instrument_files
+
+    # Create Temp Build Dir
+    build_dir = Dir.mktmpdir('apt_greybox_build')
+    # Cleanup at exit
+    at_exit do
+      FileUtils.remove_entry(build_dir)
+    rescue StandardError
+      nil # bad practice
+    end
+
+    results.each do |r|
+      rel = Pathname.new(r[:path]).relative_path_from(source_dir)
+      dest = File.join(build_dir, rel.to_s)
+      FileUtils.mkdir_p(File.dirname(dest))
+      File.binwrite(dest, r[:out])
+    end
+
+    # Copy headers too
+    Dir.glob(File.join(source_dir, '**', '*.h')).each do |h|
+      rel = Pathname.new(h).relative_path_from(source_dir)
+      dest = File.join(build_dir, rel.to_s)
+      FileUtils.mkdir_p(File.dirname(dest))
+      FileUtils.cp(h, dest)
+    end
+
+    # Compile (ASAN)
+    bin_path = File.join(build_dir, 'fuzz_target')
+    # Find all .c files in build dir
+    c_files = Dir.glob(File.join(build_dir, '**', '*.c'))
+
+    # Compilation command
+    cmd = "gcc -O0 -g -fsanitize=address -fno-omit-frame-pointer #{c_files.join(' ')} -o #{bin_path}"
+
+    log_info 'Compiling...'
+    raise "Compilation failed: #{cmd}" unless system(cmd)
+
+    log_success "Compiled successfully. SHM Size: #{total_slots} slots."
+
+    @target_bin = bin_path
+
+    # Initialize Shared Memory (/dev/shm)
+    # Using PID to avoid collision
+    shm_path = "/dev/shm/apt_shm_parent_#{$$}" # rubocop:disable Style/SpecialGlobalVars
+    create_shm_file(shm_path, total_slots)
+
+    # removed at exit
+    at_exit do
+      File.unlink(shm_path)
+    rescue StandardError
+      nil
+    end
+
+    @shm_config = { path: shm_path, size: total_slots }
+  end
+
+  def create_shm_file(path, slots)
+    File.open(path, 'w+b') do |f|
+      f.truncate(slots * 8) # 8 bytes for 64-bit unsigned long
+    end
+  end
 
   # ---------------------------------------------------------
   # Process Management & IPC Setup
@@ -106,7 +225,6 @@ class CampaignController
 
       # --- CHILD PROCESS ---
       pid = fork do
-
         # shut child up
         Signal.trap('INT') { exit!(0) }
         Signal.trap('TERM') { exit!(0) }
@@ -135,35 +253,39 @@ class CampaignController
   def stop
     # Guard clause to prevent double-execution
     return unless @running
-    
+
     puts # pretty newline after ^C
     log_warn('Stopping fuzz loop and cleaning up...')
     @running = false
 
     # Kill workers explicitly
     @workers.each do |worker|
-      begin
-        Process.kill('TERM', worker.pid)
-      rescue Errno::ESRCH
-        # Already dead, ignore
-      end
+      Process.kill('TERM', worker.pid)
+    rescue Errno::ESRCH
+      # Already dead, ignore
     end
 
     # try to wait for workers
     @workers.each do |worker|
-      begin
-        Process.waitpid(worker.pid)
-      rescue Errno::ECHILD, Errno::ESRCH
-        # Already reaped or didn't exist
-      end
+      Process.waitpid(worker.pid)
+    rescue Errno::ECHILD, Errno::ESRCH
+      # Already reaped or didn't exist
     end
-    
+
     # Close pipes
     @workers.each do |w|
-      w.work_w.close rescue nil
-      w.stats_r.close rescue nil
+      begin
+        w.work_w.close
+      rescue StandardError
+        nil
+      end
+      begin
+        w.stats_r.close
+      rescue StandardError
+        nil
+      end
     end
-    
+
     # final stats
     shutdown_stats
   end
@@ -174,7 +296,7 @@ class CampaignController
 
   def run_main_fuzzing_loop
     log_success('Fuzzer parent process running.')
-    
+
     while @running
       begin
         # Manage Workers (Check for results, Assign work)
@@ -199,13 +321,13 @@ class CampaignController
     @stats.record_run(result, classification)
 
     return if classification.pass?
-    
+
     # Deduplicate
     return unless @deduplicator.add(classification.signature)
 
     log_new_bug(classification)
     @stats.record_new_discovery
-    
+
     # Queue for minimization
     @pending_work << [input, result, classification]
   end
@@ -218,7 +340,7 @@ class CampaignController
   def process_worker_events
     # Get all readable stats pipes
     readable_pipes = @workers.map(&:stats_r)
-    
+
     # NON-blocking select
     ready, = IO.select(readable_pipes, nil, nil, 0)
     return unless ready
@@ -255,10 +377,10 @@ class CampaignController
 
     # Find free workers
     free_workers = @workers.reject(&:busy)
-    
+
     free_workers.each do |worker|
       break if @pending_work.empty?
-      
+
       work_item = @pending_work.shift
       worker.busy = true
       send_ipc_message(worker.work_w, work_item)
@@ -278,21 +400,21 @@ class CampaignController
       unminimized_size: msg[:original_size],
       min_result: msg[:min_stats]
     )
-    @stats.record_minimization(msg[:min_stats])
+    @stats.record_minimization(msg[:min_stats]) if msg[:min_stats]
     @stats.record_saved_report
-    
+
     log_minimization_done(msg[:classification], msg[:original_size], msg[:minimized_input].bytesize)
   end
 
   def handle_side_effect_bug(msg)
     cls = msg[:classification]
     # Check deduplicator (Parent's copy is the valid one)
-    if @deduplicator.add(cls.signature)
-      log_new_bug_during_min(cls)
-      @stats.record_new_discovery
-      # Add to work queue
-      @pending_work << [msg[:input], msg[:run_result], cls]
-    end
+    return unless @deduplicator.add(cls.signature)
+
+    log_new_bug_during_min(cls)
+    @stats.record_new_discovery
+    # Add to work queue
+    @pending_work << [msg[:input], msg[:run_result], cls]
   end
 
   def shutdown_stats
@@ -309,25 +431,48 @@ class CampaignController
   def minimizer_worker_loop(id, pipe_in, pipe_out)
     $0 = "fuzzer_worker_#{id}" # for better btop :)
 
-    loop do
-      begin
-        # Blocking read - wait for work
-        item = read_ipc_message(pipe_in)
-        break if item.nil? # Parent closed pipe
+    # TASK 3: SETUP WORKER-SPECIFIC SHM IF NEEDED
+    # ELSE MINIMIZER RUNS WILL CLASH WITH FUZZER RUNS
+    # AND OTHER MINIMIZERS
+    worker_runner = @runner
+    worker_shm_path = nil
 
-        input, result, classification = item
-        
-        # Perform Minimization
-        process_failure_in_worker(id, pipe_out, input, result, classification)
-
-      rescue StandardError => e
-        # Print to stderr to avoid messing up parent's pipe logic
-        warn "[Worker #{id}] Error: #{e.message}"
+    if @shm_config
+      worker_shm_path = "/dev/shm/apt_shm_worker_#{id}_#{$$}"
+      create_shm_file(worker_shm_path, @shm_config[:size])
+      at_exit do
+        File.unlink(worker_shm_path)
+      rescue StandardError
+        nil
       end
+
+      worker_runner = Runner::ExternalRunner.new(
+        target_path: @target_bin,
+        mode: @config.input_mode,
+        run_timeout_ms: RUN_TIMEOUT_MS,
+        shm_config: { path: worker_shm_path, size: @shm_config[:size] }
+      )
+    end
+
+    loop do
+      # Blocking read - wait for work
+      item = read_ipc_message(pipe_in)
+      break if item.nil?
+
+      # Parent closed pipe
+
+      input, result, classification = item
+
+      # Perform Minimization with worker_runner
+      process_failure_in_worker(id, pipe_out, input, result, classification, worker_runner)
+    rescue StandardError => e
+      # Print to stderr to avoid messing up parent's pipe logic
+      warn "[Worker #{id}] Error: #{e.message}"
     end
   end
 
-  def process_failure_in_worker(id, pipe_out, input, result, classification)
+  # TASK 3: specify runner now
+  def process_failure_in_worker(id, pipe_out, input, result, classification, runner)
     log_info("Worker #{id} minimizing: #{classification.signature.cyan}")
 
     original_size = input.bytes.size
@@ -337,15 +482,15 @@ class CampaignController
 
     if @config.minimize_enabled?
       # create a custom observer that can talk back to parent over pipe
-      observer = create_ipc_bug_observer(classification.signature, pipe_out)
-      
+      observer = create_ipc_bug_observer(classification.signature, pipe_out, runner)
+
       min_result = Minimizer::Ddmin.run(
         input_bytes: input.bytes,
         bug_observer: observer
       )
-      
+
       final_input = min_result.minimized_input
-      final_result = @runner.run(final_input)
+      final_result = runner.run(final_input)
     end
 
     # Send success event back to parent
@@ -360,9 +505,10 @@ class CampaignController
     send_ipc_message(pipe_out, event)
   end
 
-  def create_ipc_bug_observer(original_sig, pipe_out)
+  # TASK 3: specify runner now
+  def create_ipc_bug_observer(original_sig, pipe_out, runner)
     lambda do |bytes|
-      run_result = @runner.run(bytes)
+      run_result = runner.run(bytes)
       classification = @oracle.classify(run_result, nil)
 
       is_original = (classification.signature == original_sig)
@@ -417,7 +563,7 @@ class CampaignController
   def setup_signal_traps
     log_info('Setting up signal traps (Ctrl+C to stop)...')
     # We raise Interrupt to break the main loop.
-    # The 'ensure' block in the run method will catch this 
+    # The 'ensure' block in the run method will catch this
     # and call 'stop' in a safe thread context.
     Signal.trap('INT') { raise Interrupt }
     Signal.trap('TERM') { raise Interrupt }
@@ -425,6 +571,7 @@ class CampaignController
 
   def spawn_timeout_thread
     return unless @hard_timeout&.to_i&.positive?
+
     graceful_exit_delay = @hard_timeout.to_i - 10
     return if graceful_exit_delay <= 0
 

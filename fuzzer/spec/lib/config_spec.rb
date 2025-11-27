@@ -112,7 +112,7 @@ describe 'Config' do
           'RESULT_FUZZ' => result_dir
         }
         load_config_with_env(mock_env)
-        expect { Config.validate! }.to raise_error(/not found or not executable/)
+        expect { Config.validate! }.to raise_error("ERROR: FUZZED_PROG '/tmp/not/a/real/file' not found.")
       end
     end
 

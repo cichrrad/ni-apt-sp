@@ -48,7 +48,15 @@ module Config
   # Start up guards
   def self.validate!
     raise 'ERROR: FUZZED_PROG env var not set or empty.' if FUZZED_PROG.nil? || FUZZED_PROG.empty?
-    raise "ERROR: FUZZED_PROG '#{FUZZED_PROG}' not found or not executable." unless File.executable?(FUZZED_PROG)
+
+    # Check if file or directory exists
+    raise "ERROR: FUZZED_PROG '#{FUZZED_PROG}' not found." unless File.exist?(FUZZED_PROG)
+
+    # If it is a file, it must be executable (Blackbox mode compatibility)
+    if File.file?(FUZZED_PROG) && !File.executable?(FUZZED_PROG)
+      raise "ERROR: FUZZED_PROG '#{FUZZED_PROG}' found but not executable."
+    end
+
     raise 'ERROR: RESULT_FUZZ env var not set or empty.' if RESULT_FUZZ.nil? || RESULT_FUZZ.empty?
 
     # Try to crete result dir

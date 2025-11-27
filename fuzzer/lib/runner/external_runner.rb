@@ -4,7 +4,7 @@ require 'tempfile'
 require 'pry'
 
 # Single run result struct
-RunResult = Struct.new(:exit_code, :stdout, :stderr, :wall_time_ms, :timed_out, keyword_init: true)
+RunResult = Struct.new(:exit_code, :stdout, :stderr, :wall_time_ms, :timed_out, :coverage, keyword_init: true)
 
 module Runner
   # ExternalRunner executes toy program with generated input.
@@ -15,7 +15,8 @@ module Runner
   class ExternalRunner
     DEFAULT_TIMEOUT_MS = 5_000
 
-    def initialize(target_path:, mode: :stdin, run_timeout_ms: DEFAULT_TIMEOUT_MS, work_dir: nil, keep_files: false)
+    def initialize(target_path:, mode: :stdin, run_timeout_ms: DEFAULT_TIMEOUT_MS, work_dir: nil, keep_files: false,
+                   shm_config: nil)
       raise ArgumentError, 'mode must be :stdin, :file, or :argv' unless %i[stdin file argv].include?(mode)
 
       @target_path   = String(target_path)
@@ -23,9 +24,19 @@ module Runner
       @run_timeout_ms = Integer(run_timeout_ms)
       @work_dir      = work_dir
       @keep_files    = !!keep_files
+
+      @shm_path = shm_config&.dig(:path)
+      @shm_size = shm_config&.dig(:size)
     end
 
     def run(fuzz_input)
+      # Reset Shared Memory
+      if @shm_path
+        # Fast zeroing
+        zeros = "\x00" * (@shm_size * 8)
+        File.binwrite(@shm_path, zeros)
+      end
+
       bytes = extract_bytes(fuzz_input)
 
       tempfile = nil
@@ -60,9 +71,13 @@ module Runner
         }
         spawn_opts[:chdir] = @work_dir if @work_dir
 
+        # Setup Env
+        env_vars = {}
+        env_vars['__APT_SHM_PATH'] = @shm_path if @shm_path
+
         # Spawn child
         # https://docs.ruby-lang.org/en/3.4/Process.html
-        pid = Process.spawn(*argv, spawn_opts)
+        pid = Process.spawn(env_vars, *argv, spawn_opts)
 
         # Piping setup
         stdin_r.close
@@ -133,15 +148,24 @@ module Runner
 
         stdout = out_buf.force_encoding(Encoding::ASCII_8BIT)
         stderr = err_buf.force_encoding(Encoding::ASCII_8BIT)
+
         # HERE we stop timing (after pipes are drained)
         wall_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000.0).to_i
+
+        coverage_data = nil
+        if @shm_path
+          raw = File.binread(@shm_path)
+          # Unpack unsigned long (native size)
+          coverage_data = raw.unpack('Q*') if raw
+        end
 
         RunResult.new(
           exit_code: status&.exitstatus, # nil if killed by signal/timeout
           stdout: stdout,
           stderr: stderr,
           wall_time_ms: wall_ms,
-          timed_out: timed_out
+          timed_out: timed_out,
+          coverage: coverage_data
         )
       # 'finally' -- always try to clean up and sanity check
       ensure

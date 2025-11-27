@@ -129,38 +129,61 @@ class Instrumentor
   end
 
   # build prologue for a file
+  # TASK 3 CHANGES:
+  # - static arrays are now fallback for when
+  # we do blackbox fuzzing
+  # - we now have ptrs which will point
+  # into shared memory where lcov for that
+  # file will be updated live. we must let go
+  # of atexit, because in the case when we would
+  # need lcov the most (crash), atexit is not run
+  # (duh) = no lcov + its slow asf
+  # - to allow blackbox fuzzing still, we
+  # set the pointer based on env var denoting
+  # what mode we are in (see runtime)
   def prologue(file_model, file_plan, file_id)
-    n = file_plan.nlines + 1 # 1-based
+    n = file_plan.nlines + 1 # 1-based size
 
-    # mask mapping out (with 1s)
-    # all instrumented lines in this file
     mask = Array.new(n, 0)
     file_plan.instrument_lines.each { |line| mask[line] = 1 }
 
     c_path = escape_c_string(file_model.path)
 
-    # actual C code that will be injected
     <<~C
       /* __APT_COV__ prologue begin */
       #include <stdio.h>
       #include <stdlib.h>
-      struct __apt_file { const char *path; unsigned long *hits; int nlines; const unsigned char *mask; };
+      struct __apt_file {#{' '}
+        const char *path;#{' '}
+        unsigned long **hits_ptr_ref; /* CHANGED: Pointer to the hits pointer */
+        int nlines;#{' '}
+        const unsigned char *mask;#{' '}
+      };
       void __apt_register(struct __apt_file*);
-      static unsigned long __apt_hits_#{file_id}[#{n}] = {0};
+
+      /* Fallback storage in BSS */
+      static unsigned long __apt_store_#{file_id}[#{n}] = {0};
+      /* Active pointer - defaults to fallback */
+      static unsigned long *__apt_hits_#{file_id} = __apt_store_#{file_id};
+
       static const unsigned char __apt_mask_#{file_id}[#{n}] = { #{mask.join(',')} };
-      static struct __apt_file __apt_me_#{file_id} = { "#{c_path}", __apt_hits_#{file_id}, #{n - 1}, __apt_mask_#{file_id} };
+
+      /* We pass the ADDRESS of the pointer so runtime can swap it */
+      static struct __apt_file __apt_me_#{file_id} = {#{' '}
+        "#{c_path}",#{' '}
+        &__apt_hits_#{file_id},#{' '}
+        #{n - 1},#{' '}
+        __apt_mask_#{file_id}#{' '}
+      };
+
       void __apt_register_#{file_id}(void) { __apt_register(&__apt_me_#{file_id}); }
       /* __APT_COV__ prologue end */
     C
   end
 
-  # inject runtime header only in main file
-  # specifies:
-  #   > array for 512 files (~TUs)
-  #   > number of files
-  #   > file register func
-  #   > writer func which will
-  #     save results upon atexit()
+  # TASK 3 CHANGES:
+  # - added pointer swapping setup which
+  # should allow shared memory into /dev/shm
   def runtime
     <<~C
       /* __APT_COV__ runtime begin */
@@ -168,23 +191,72 @@ class Instrumentor
       #define __APT_RUNTIME_ONCE
       #include <stdio.h>
       #include <stdlib.h>
+      #include <string.h>
+      #include <sys/mman.h>
+      #include <sys/stat.h>
+      #include <fcntl.h>
+      #include <unistd.h>
+
       static struct __apt_file* __apt_files[512];
       static int __apt_nfiles = 0;
-      void __apt_register(struct __apt_file* f) {
-        if (__apt_nfiles < (int)(sizeof(__apt_files)/sizeof(__apt_files[0]))) __apt_files[__apt_nfiles++] = f;
+      static int __apt_total_slots = 0;
+
+      /* SHM State */
+      static unsigned long *__apt_shm_ptr = NULL;
+      static int __apt_shm_active = 0;
+
+      static void __apt_init_shm(void) {
+        char *path = getenv("__APT_SHM_PATH");
+        if (!path) return;
+
+        int fd = open(path, O_RDWR);
+        if (fd < 0) return;
+
+        /* Map the file based on its actual size on disk */
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > 0) {
+           __apt_shm_ptr = (unsigned long *)mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+           if (__apt_shm_ptr != MAP_FAILED) {
+             __apt_shm_active = 1;
+           }
+        }
+        close(fd);
       }
+
+      void __apt_register(struct __apt_file* f) {
+        /* Lazy initialization */
+        if (__apt_nfiles == 0) __apt_init_shm();
+
+        if (__apt_nfiles < 512) {
+          __apt_files[__apt_nfiles++] = f;
+
+          /* POINTER SWAP: Redirect writes to SHM if active */
+          if (__apt_shm_active) {
+             *f->hits_ptr_ref = __apt_shm_ptr + __apt_total_slots;
+          }
+      #{'    '}
+          __apt_total_slots += (f->nlines + 1);
+        }
+      }
+
       static void __apt_write_lcov(void) {
+        /* If using SHM, no need to write file */
+        if (__apt_shm_active) return;
+
         FILE *fp = fopen("coverage.lcov", "w");
         if (!fp) return;
         fprintf(fp, "TN:test\\n");
         for (int i = 0; i < __apt_nfiles; i++) {
           struct __apt_file *f = __apt_files[i];
+          /* Read from wherever the pointer is currently pointing */
+          unsigned long *hits = *f->hits_ptr_ref;
+
           fprintf(fp, "SF:%s\\n", f->path);
           int LF = 0, LH = 0;
           for (int line = 1; line <= f->nlines; line++) {
             if (!f->mask[line]) continue;
             LF++;
-            unsigned long c = f->hits[line];
+            unsigned long c = hits[line];
             if (c) { fprintf(fp, "DA:%d,%lu\\n", line, c); LH++; }
           }
           fprintf(fp, "LH:%d\\nLF:%d\\nend_of_record\\n", LH, LF);
