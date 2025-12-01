@@ -20,6 +20,21 @@ module Config
 
   TIMEOUT = ENV['TIMEOUT']
 
+  # Power Schedule: :simple (default), :boosted, :fast
+  POWER_SCHEDULE = case ENV['POWER_SCHEDULE']&.downcase
+                   when 'boosted' then :boosted
+                   when 'fast'    then :fast
+                   else :simple
+                   end
+
+  INPUT_SEEDS = ENV['INPUT_SEEDS']
+
+  # Fuzzer Type: :greybox (default), :blackbox
+  FUZZER_TYPE = case ENV['FUZZER']&.downcase
+                when 'blackbox' then :blackbox
+                else :greybox
+                end
+
   # 'Global' getters for env vars
   def self.fuzzed_program
     FUZZED_PROG
@@ -43,6 +58,18 @@ module Config
 
   def self.minimize_enabled?
     MINIMIZE_ENABLED
+  end
+
+  def self.power_schedule
+    POWER_SCHEDULE
+  end
+
+  def self.input_seeds
+    INPUT_SEEDS
+  end
+
+  def self.fuzzer_type
+    FUZZER_TYPE
   end
 
   # Start up guards

@@ -316,6 +316,7 @@ class CampaignController
   def run_one_iteration
     input = @generator.next
     result = @runner.run(input)
+
     classification = @oracle.classify(result, input)
 
     @stats.record_run(result, classification)
