@@ -18,6 +18,12 @@ require 'results/stats_aggregator'
 require 'results/results_store'
 require 'minimize/ddmin'
 
+# --- Greybox Components ---
+require 'greybox/seed'
+require 'greybox/seed_queue'
+require 'greybox/coverage_tracker'
+require 'greybox/mutator'
+
 # task 1 imports
 COV_LIB = File.expand_path('../../code-coverage/src', __dir__)
 $LOAD_PATH.unshift(COV_LIB)
@@ -47,16 +53,26 @@ class CampaignController
   # (These are now real forks, not threads!)
   MINIMIZER_PROCESSES = 2
 
+  # How many random inputs to generate if queue is empty
+  BOOTSTRAP_COUNT = 500
+
   def initialize
     @config = Config
     @config.validate!
-
     @shm_config = nil # Default Blackbox
+    @greybox_mode = (@config.fuzzer_type == :greybox)
 
     # TASK 3 : Check if we need to compile
     if File.directory?(@config.fuzzed_program)
+      raise StandardError, 'blackbox must be run on pre-compiled binary' unless @greybox_mode
+
       compile_target(@config.fuzzed_program)
     else
+      if @greybox_mode
+        raise StandardError,
+              'greybox must instrument and compile the program, dont provide binary for it'
+      end
+
       @target_bin = @config.fuzzed_program
     end
 
@@ -79,6 +95,17 @@ class CampaignController
       fuzzed_program: @config.fuzzed_program
     )
     @store = Results::ResultsStore.new(root_dir: @config.result_dir)
+
+    # --- Greybox Init ---
+    if @greybox_mode
+
+      @seed_queue = Greybox::SeedQueue.new(
+        result_dir: @config.result_dir,
+        power_schedule: @config.power_schedule
+      )
+      @coverage_tracker = Greybox::CoverageTracker.new
+      @mutator = Greybox::Mutator.new
+    end
 
     # --- State ---
     @running = true
@@ -103,6 +130,9 @@ class CampaignController
     # inherit sig traps
     setup_signal_traps
     spawn_timeout_thread
+
+    # TASK 3: Bootstrap if Greybox
+    bootstrap_queue if @greybox_mode
 
     begin
       run_main_fuzzing_loop
@@ -133,6 +163,7 @@ class CampaignController
     file_models = []
     file_plans = []
     total_slots = 0
+    total_instrumented = 0
 
     files.each do |p|
       src = File.binread(p)
@@ -141,6 +172,7 @@ class CampaignController
       file_models << fm
       file_plans << plan
       total_slots += (plan.nlines + 1)
+      total_instrumented += plan.instrument_lines.size
     end
 
     inst.plan_edits(file_models: file_models, file_plans: file_plans)
@@ -181,7 +213,8 @@ class CampaignController
     log_info 'Compiling...'
     raise "Compilation failed: #{cmd}" unless system(cmd)
 
-    log_success "Compiled successfully. SHM Size: #{total_slots} slots."
+    @total_instrumented_lines = total_instrumented
+    log_success "Compiled successfully. SHM Size: #{total_slots} slots. Instr: #{total_instrumented}"
 
     @target_bin = bin_path
 
@@ -204,6 +237,40 @@ class CampaignController
     File.open(path, 'w+b') do |f|
       f.truncate(slots * 8) # 8 bytes for 64-bit unsigned long
     end
+  end
+
+  # ---------------------------------------------------------
+  # TASK 3: Greybox Bootstrap
+  # ---------------------------------------------------------
+
+  def bootstrap_queue
+    log_info 'Bootstrapping Greybox Queue...'
+    log_info "Using #{@config.power_schedule} schedule"
+    # Load Seeds if provided
+    if @config.input_seeds && Dir.exist?(@config.input_seeds)
+      files = Dir.glob(File.join(@config.input_seeds, '*')).select { |f| File.file?(f) }
+      unless files.empty?
+        log_info "Loading #{files.size} seeds from #{@config.input_seeds}..."
+        files.each do |f|
+          # just read as binary blobs
+          # (from what I found this is common practice?)
+          data = File.binread(f)
+          # We must run them to get coverage/energy stats
+          process_greybox_input(FuzzInput.new(bytes: data), nil)
+        end
+        return
+      end
+    end
+
+    # Fallback: Generate substantial amount of random seeds to kick start the fuzzer
+    log_info "No input seeds found. Generating #{BOOTSTRAP_COUNT} random seeds..."
+    BOOTSTRAP_COUNT.times do |i|
+      input = @generator.next
+      process_greybox_input(input, nil)
+      print "\r  Generated #{i + 1}/#{BOOTSTRAP_COUNT}..."
+    end
+    puts '' # pretty newline
+    log_success "Bootstrap complete. Queue size: #{@seed_queue.size}"
   end
 
   # ---------------------------------------------------------
@@ -305,7 +372,20 @@ class CampaignController
         # Fuzz
         run_one_iteration
         @counter += 1
-        log_info("Fuzzed #{@counter} inputs.") if (@counter % 100).zero?
+
+        # Detailed updates for greybox
+        if (@counter % 100).zero?
+          if @greybox_mode
+            # Calculate percentage
+            cov = @coverage_tracker.global_hits.size
+            total = @total_instrumented_lines || 1 # avoid div by zero
+            pct = (cov.to_f / total * 100).round(1)
+
+            log_info("Fuzzed #{@counter}. Queue: #{@seed_queue.size} Cov: #{cov}/#{total} (#{pct}%)")
+          else
+            log_info("Fuzzed #{@counter} inputs.")
+          end
+        end
       rescue StandardError => e
         log_error("Parent Loop Error: #{e.message}\n#{e.backtrace.join("\n")}")
         sleep 1
@@ -314,23 +394,82 @@ class CampaignController
   end
 
   def run_one_iteration
-    input = @generator.next
+    # Decide Input Source
+    parent_seed = nil
+    input = nil
+
+    if @greybox_mode
+      # Select Parent
+      parent_seed = @seed_queue.sample(@coverage_tracker)
+
+      if parent_seed
+        # Mutate
+        mutated_data = @mutator.mutate(parent_seed.data, @seed_queue)
+        input = FuzzInput.new(bytes: mutated_data)
+      else
+        # Fallback if queue empty
+        # (should not happen almost at all)
+        input = @generator.next
+      end
+
+      # Process
+      process_greybox_input(input, parent_seed)
+    else
+      # Blackbox Mode (Legacy)
+      input = @generator.next
+      result = @runner.run(input)
+      handle_result(input, result)
+    end
+  end
+
+  # Helper for execution + Greybox logic
+  def process_greybox_input(input, parent_seed)
     result = @runner.run(input)
 
-    classification = @oracle.classify(result, input)
+    # Check Coverage
+    is_cov_interesting, path_hash = @coverage_tracker.interesting?(result.coverage)
 
+    # Check for Crashes/Hangs (AND if they are new)
+    # This also handles queuing them for minimization
+    is_bug_interesting = handle_result(input, result)
+
+    # If Interesting (Cov OR New Bug) -> Add to Queue
+    if is_cov_interesting || is_bug_interesting
+      new_seed = Greybox::Seed.new(
+        data: input.bytes,
+        coverage_hash: path_hash,
+        exec_time_ms: result.wall_time_ms
+      )
+      @seed_queue.add(new_seed)
+
+      parent_seed.stats.new_coverage_count += 1 if parent_seed && is_cov_interesting
+    end
+
+    # Always update Parent stats (if exists)
+    # (it might not exist if we pulled the input out of thin air
+    # -- when we fallback to random gen)
+    parent_seed.stats.mutation_count += 1 if parent_seed
+  end
+
+  # Shared Crash/Hang Handler
+  # Returns TRUE if it was a NEW bug, FALSE otherwise
+  def handle_result(input, result)
+    classification = @oracle.classify(result, input)
     @stats.record_run(result, classification)
 
-    return if classification.pass?
+    return false if classification.pass?
 
-    # Deduplicate
-    return unless @deduplicator.add(classification.signature)
+    # Deduplicate: Returns true if NEW, false if SEEN
+    if @deduplicator.add(classification.signature)
+      log_new_bug(classification)
+      @stats.record_new_discovery
 
-    log_new_bug(classification)
-    @stats.record_new_discovery
+      # Queue for minimization
+      @pending_work << [input, result, classification]
+      return true # It IS interesting (new bug)
+    end
 
-    # Queue for minimization
-    @pending_work << [input, result, classification]
+    false # Not interesting (duplicate bug)
   end
 
   # ---------------------------------------------------------
@@ -352,7 +491,8 @@ class CampaignController
       next unless worker
 
       msg = read_ipc_message(pipe)
-      next if msg.nil? # Pipe closed or error
+      # Pipe closed or error
+      next if msg.nil?
 
       handle_worker_message(worker, msg)
     end
@@ -393,13 +533,13 @@ class CampaignController
   # ---------------------------------------------------------
 
   def save_worker_result(msg)
-    #
     @store.save_report(
       classification: msg[:classification],
       run_result: msg[:run_result],
       minimized_input: msg[:minimized_input],
       unminimized_size: msg[:original_size],
-      min_result: msg[:min_stats]
+      min_result: msg[:min_stats],
+      coverage: @greybox_mode ? @coverage_tracker.global_hits.size : 0
     )
     @stats.record_minimization(msg[:min_stats]) if msg[:min_stats]
     @stats.record_saved_report
@@ -420,6 +560,10 @@ class CampaignController
 
   def shutdown_stats
     log_warn('Shutting down. Saving final statistics...')
+    if @greybox_mode
+      @stats.current_queue_size = @seed_queue.size
+      @stats.current_coverage = @coverage_tracker.global_hits.size
+    end
     stats_path = File.join(@config.result_dir, 'statistics.json')
     @stats.save(stats_path)
     log_success("Statistics saved to #{stats_path}")
@@ -590,6 +734,11 @@ class CampaignController
   def log_startup
     puts '--- Fuzzer Starting (Multi-Process Mode) ---'.bold
     puts "  Target:    #{@config.fuzzed_program.light_blue}"
+    puts "  Mode:      #{@config.fuzzer_type.to_s.upcase.light_magenta}"
+    if @greybox_mode
+      puts "  Schedule:  #{@config.power_schedule.to_s.cyan}"
+      puts "  Queue Dir: #{File.join(@config.result_dir, 'queue').light_black}"
+    end
     puts "  Workers:   #{MINIMIZER_PROCESSES.to_s.light_blue}"
     puts "  Minimize:  #{@config.minimize_enabled?.to_s.light_blue}"
     puts '-----------------------'

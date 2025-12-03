@@ -21,7 +21,7 @@ module Config
   TIMEOUT = ENV['TIMEOUT']
 
   # Power Schedule: :simple (default), :boosted, :fast
-  POWER_SCHEDULE = case ENV['POWER_SCHEDULE']&.downcase
+  POWER_SCHEDULE = case ENV['POWER_SCHEDULE']&.strip&.downcase
                    when 'boosted' then :boosted
                    when 'fast'    then :fast
                    else :simple
@@ -30,7 +30,7 @@ module Config
   INPUT_SEEDS = ENV['INPUT_SEEDS']
 
   # Fuzzer Type: :greybox (default), :blackbox
-  FUZZER_TYPE = case ENV['FUZZER']&.downcase
+  FUZZER_TYPE = case ENV['FUZZER']&.strip&.downcase
                 when 'blackbox' then :blackbox
                 else :greybox
                 end

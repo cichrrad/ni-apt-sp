@@ -1,15 +1,16 @@
 {
-  "input": "pz`z",
+  "input": "jM%&-fmC",
   "oracle": "asan",
   "bug_info": {
     "file": "mock.c",
-    "line": 20,
+    "line": 120,
     "kind": "stack"
   },
+  "coverage": 21,
   "execution_time": 40,
   "minimization": {
-    "unminimized_size": 4,
-    "nb_steps": 12,
-    "execution_time": 127
+    "unminimized_size": 171,
+    "nb_steps": 48,
+    "execution_time": 696
   }
 }

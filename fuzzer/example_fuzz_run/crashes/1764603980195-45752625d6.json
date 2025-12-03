@@ -1,15 +1,16 @@
 {
-  "input": "S}  ",
+  "input": "pf%>",
   "oracle": "asan",
   "bug_info": {
     "file": "mock.c",
-    "line": 41,
-    "kind": "heap"
+    "line": 129,
+    "kind": "stack"
   },
+  "coverage": 21,
   "execution_time": 40,
   "minimization": {
-    "unminimized_size": 86,
+    "unminimized_size": 89,
     "nb_steps": 28,
-    "execution_time": 474
+    "execution_time": 442
   }
 }

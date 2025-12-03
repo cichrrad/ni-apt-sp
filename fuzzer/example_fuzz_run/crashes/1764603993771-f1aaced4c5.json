@@ -1,15 +1,16 @@
 {
-  "input": "H)MO@Sd[",
+  "input": "H8CY/h{!",
   "oracle": "asan",
   "bug_info": {
     "file": "mock.c",
-    "line": 30,
+    "line": 139,
     "kind": "heap"
   },
+  "coverage": 23,
   "execution_time": 40,
   "minimization": {
-    "unminimized_size": 47,
+    "unminimized_size": 84,
     "nb_steps": 46,
-    "execution_time": 637
+    "execution_time": 641
   }
 }

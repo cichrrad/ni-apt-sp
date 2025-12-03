@@ -1,0 +1,12 @@
+{
+  "input": "k8UU?)&P?,Q#cR<~o|W\"E%wtG!0l%{+-I reFrkb+zOT*WGbmWz-KDVe%{f)=mnM^Nm{UxB|p$hi'\"DfsnZ_w_9y?SwM-y8rR)teyir-P}eIV}7wnTHLWCVMmTw Vgc?|q-~vDX,hX>uFu_i8QIB!kAsLB/,~ULcw{g1!Bu7S<Y2~T1U",
+  "oracle": "return_code",
+  "bug_info": 1,
+  "coverage": 26,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 874,
+    "nb_steps": 848,
+    "execution_time": 50842
+  }
+}

@@ -1,7 +1,7 @@
 BUNDLE = bundle
 RUBY = setarch $(uname -m) -R ruby
 RSPEC = setarch $(uname -m) -R $(BUNDLE) exec rspec
-FUZZER = bin/fuzzer
+FUZZER_BINARY = bin/fuzzer
 
 # test binaries
 BIN_DIR = target_programs/binary
@@ -11,7 +11,7 @@ SRC_DIR = target_programs/src
 build:
 	@echo "Running bundle install"
 	@$(BUNDLE) install
-	@chmod +x $(FUZZER)
+	@chmod +x $(FUZZER_BINARY)
 	@echo "Compiling test targets in $(SRC_DIR) -> $(BIN_DIR)..."
 	@mkdir -p $(BIN_DIR)
 	@for file in $(SRC_DIR)/*.c; do \
@@ -32,4 +32,4 @@ test:
 
 .PHONY: run
 run: build
-	@$(BUNDLE) exec $(RUBY) $(FUZZER)
+	@$(BUNDLE) exec $(RUBY) $(FUZZER_BINARY)
