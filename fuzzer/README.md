@@ -1,128 +1,176 @@
-# Random Fuzzer - NI-APT task 2
+# Greybox fuzzing - NI-APT task 3
 
-I've implemented random fuzzer task in Ruby. As per the Task 1 feedback (+ also because as far as I understand, this task is foundation for future tasks), I've actually planned ahead in regards of file structure to hopefully keep the directory somewhat sane, and most importantly, expandable for future tasks. I've also tried to stay away from helper bash scripts and such, aiming at implementing everything in Ruby or Makefile 
+> Note: -- This heavily relies on prior knowledge about task 1 and 2 (duh). To not make this **README** novel book long, I'm assuming they (and their **READMEs**) are on hand and can be referenced.
+---
 
-This actually taught me few nice things (explicitly, I found out that ruby formatting is strangely opinionated -- if you've used `rubocop`, you know... -- and that `rspec` explores `spec/` directory if it is present and runs all spec files in it, which is awesome! In addition to that, I found out about `pry` gem which is very nice for debugging).
+In task 3 I've expanded task 2 random fuzzer to now have a second mode -- **Greybox**. In order to do this, I had to go back to task 1 and patch it to share coverage in real-time (not using `atexit`) into shared memory in `/dev/shm/...`, add new modules & classes (`lib/greybox/*.rb`) to support seed mutation,queue, etc. and patch the main `bin/fuzzer`. I tried to complete everything before soft deadline -- alas, I did not find the time to do it all, so I am at least handing in partial work to see how it fares and I will complete what I did not have time for later.
+
+I've implemented the following mutation ops (`lib/greybox/mutator.rb`):
+
+* **bitflip**
+
+* **+/- 1..35 to random byte**
+
+* **delete/insert random data of random length** (up to all data for delete and 64 bytes for insert)
+
+* **splice** -- pick random second seed from the seed queue, split at random points and frankenstein the 2 together.
+
+I've added support for global in `lib/oracle/asan_oracle.rb`, so it can now be caught too. I've also modified `lib/config.rb` to recognize new env vars needed (`FUZZER`,`POWER_SCHEDULE`,`INPUT_SEEDS`).
+
+Biggest changes are in `bin/fuzzer`, as now we need to recognize 2 modes and based on that, our fuzzer behaves differently. 
+
+>In between tasks 2 and 3 I've also made a big change to minimizers -- they are now truly parallel using forks, not just concurrent like before when using threads. This meant reworking communication between them and such. Since I am not getting coverage updates back from the minimizers though, this change is suprisingly non-impeding for task 3.
+
+## Fuzzer changes
+
+Aside from changing workers to be forked instead of spawning threads, logic of the main script was changed to allow for launching in 2 modes -- **blackbox** (legacy) and **greybox**. You can specify this with `FUZZER` env variable, and there are certain safeguards in place:
+
+* You **CANNOT** launch fuzzer in **blackbox**, if `FUZZED_PROG` is pointing at directory (It should point at compiled binary).
+* You **CANNOT** launch fuzzer in **greybox**, if `FUZZED_PROG` is pointing at file (It should point at folder with `.c` files it will instrument).
+
+This has to be because I need to instrument the program for **greybox**, so that I have instrumentor (from task 1) context to set up and align shared memory for the fuzzing campaign. 
+>Note that minimizer processes will run the same instrumented binary -- they will also have shared memory (at different places though, so it does not clash), which is wasteful considering I am not using this for anything currently, but it is what it is.
+
+If we run **blackbox**, the campaign is basically the same as it was in task 2 (aside from added fields in stats, but they are `0` because we dont track coverage or anything).
+
+If we run **greybox**, the campaign runs differently:
+
+### Greybox
+
+> Flow of the program run walking the greybox path. I've tried to highlight the differences introduced by task 3.
+
+When this mode is selected, we initialize components for it in initialize -- `seed_queue` (init with entered power schedule), `mutator`, and `coverage_tracker`. We also compile the target program (`compile_target` method).
+
+#### `compile_target`
+
+In `compile_target`, we basically do task 1 instrumentation (modified for shared memory). **Crucially**, we **sort the files in `FUZZED_PROG` before we instrument**. This makes it so that they are registered in deterministic (sorted) order in the instrumentation code injected into `main`, which in turn means files get slots in shared memory in specific order, which we can then count on and use it to access and process shared memory from within fuzzer campaign easily. Because we know the order of the files and also number of instrumented lines of each file (since `Instrumentor` is initialized in `compile_target` so it is accessible in the fuzzer campaign) -- we can use this to trivialize memory access.
+
+#### `run`
+
+Then in `run` method, which sets up timeout thread, forks workers, and kicks off the campaign, we additionaly call `bootstrap_queue` method (`bootstrap_queue if @greybox_mode`).
+
+#### `bootstrap_queue`
+
+In `bootstrap_queue`, we try to load seeds from directory specified by `INPUT_SEEDS` env var. If it is specified we process files in it and treat them as binary blobs we use as input. If there are no seeds, we try to populate the queue by running `BOOTSTRAP_COUNT`s (fuzzer variable, **NOT env var**) generated inputs -- default is `1000`. Both of these scenarios call `process_greybox_input` method. `process_graybox_input` is also called in the main fuzzing loop after bootstrap. 
+
+#### `process_greybox`
+
+`process_greybox_input` method runs the input using unchanged (aside from it returning 1 additional field -- `coverage`) runner from task 2. It then takes `coverage` of the result and determines if it is interesting:
+```ruby
+@coverage_tracker.interesting?(result.coverage)
+```
+This true/false method (in `lib/greybox/coverage_tracker.rb`) deems seed interesting if *set of instrumented line IDs it hit* is larger/has new IDs compared to the *set of hit IDs maintained till this point*. It also updates this maintained set with new IDs if the seed hit them. It also calculates seed hash for later use in `seed_queue` when calculating energies.
+
+Additionaly, if this seed caused a bug, it defaults to being interesting too.
+
+Interesting seeds are added to `seed_queue`.
+
+#### `run_one_iteration`
+
+Coming back from the bootstrap, we go into the main loop of the campaign -- `run_main_fuzzing_loop`, inside of which we care about `run_one_iteration`. This method just branches based on mode. For greybox, it samples queue for seed it should use, then mutates it using `mutator`, then runs `process_greybox_input`.
+
+## AI
+
+Same disclosure as in task 2 **README**, with 1 exception -- the script used to generate graphs for the experiment (`/task_3_experiment/plot.py`) is vibe coded.  
+
+## Setup
+
+Only additional dependencies compared to previous tasks is python and its modules for plotting (`pandas` and `matplotlib`), if you want to do it locally. Rest of the code is basically all ruby, so that is of course a requirement for local runs too. With you ruby you can then simply do `bundle install` in the root of the repo which will install required gems from the `Gemfile`
 
 ## Testing
 
-Code coverage of my tests are **94.95%**.
+I've made sure that the legacy (task 1 and 2) test suites still work, but they of course dont test the new code paths (fully up to date coverage goes hand in hand with the mutation testing, which I dont have yet). 
 
-## Hand-in / grader notes
+When task 2 tests are run, the coverage is slightly smallert than it was -- because parts of the fuzzer, such as `lib/oracle/asan_oracle.rb` and `lib/config.rb` were extended to allow task 3 to work, so the relative % of code covered goes down.
 
-I've had some struggles with the pipeline runs, but I think my fuzzer is correct so I wanted to just note some things I tried to show that.
+### Coverage
 
-I've run the pipeline empty so that I got my hands on the inputs that trigger bugs. Then I modified my generator to only produce these inputs in loop so that I can guarantee they are found. Once I did this, I was able to verify correctness of the other parts of my fuzzer in the runner, and so I did (see [pipeline log](https://gitlab.fit.cvut.cz/cichrrad/apt-2025-cichra/-/jobs/1385142)). This way I was able to confirm that the **fuzzer passes** all the parts of the pipeline, **if it finds the inputs. So why it didn't?**
+**92.57%**(see context above)
 
-For the large inputs, it is because I simply don't generate such long inputs. My default range is printable ASCII C strings 1 to 128 chars. If there is input 1001 chars long, I won't find it. I could generate inputs in range 1 to, say 2000, but that decreases probability of smaller bug inducing inputs, as it inflates the *space of possible inputs* a lot. 
+### Mutation testing
 
-*(Unchecked and possibly very bad math below)*
+**TODO 🥲**
 
-Even if I generated **exactly** 1001 chars long input, my fuzzer tops at ~35k (MAY NOT EVEN BE UNIQUE) inputs in the 600 seconds allowed. so I explore (35000/95^1001) of all the inputs, which is roughly 0.00...(~1973 zeroes)69 % of the inputs explored. Since I don't know how the grader works inside, it is very much possible that many inputs trigger the desired bug, but it need to be A LOT to trigger it using random fuzzing in 600s (Even if my fuzzer is arguably slow, I'd be first one to admit that -- Ruby is not the most performant language out there and, more importantly, my code may very well be a mess :))
+## Experiment
+
+For the experiment, I've first added hotfixes (I kept them in the code, just commented them out) to the fuzzer script to record # of fuzzed inputs, coverage, time, and # of instrumented lines into `.csv` file. 
+
+I've ran the fuzzer 3 times (Once for each `POWER_SCHEDULE`) on the same `mock.c` program I was using in previous task (`target_programs/greybox_test`):
+```bash
+#fast
+export FUZZED_PROG=target_programs/greybox_test/ && export RESULT_FUZZ=./experiment_fast_ps && export INPUT=stdin && export MINIMIZE=1 && export TIMEOUT=310 && export FUZZER=greybox && export POWER_SCHEDULE=fast && make run
+```
+```bash
+#simple
+export FUZZED_PROG=target_programs/greybox_test/ && export RESULT_FUZZ=./experiment_simple_ps && export INPUT=stdin && export MINIMIZE=1 && export TIMEOUT=310 && export FUZZER=greybox && export POWER_SCHEDULE=simple && make run
+```
+```bash
+#boosted
+export FUZZED_PROG=target_programs/greybox_test/ && export RESULT_FUZZ=./experiment_boosted_ps && export INPUT=stdin && export MINIMIZE=1 && export TIMEOUT=310 && export FUZZER=greybox && export POWER_SCHEDULE=boosted && make run
+```
+
+Then I did the same on a more complex `uniq.c` program from the repo linked on courses.
+
+> I had to tweak the `.c` code a little bit, because short form conditionals such as `if (cond) code;` without braces break my instrumentation. But the code should behave the same, I just added braces. Code can be found in `target_programs/task3_uniq`.
+
+### Results -- `mock.c`
+
+![mock_g](./task_3_experiment/results_mock/experiment_results_mock.png)
 
 ---
-> NOTE: -- Sorry the README.md is a bit chaotic, I probably won't have time to polish it as I had with the first task
-## AI 
 
-As per task directions, I disclose I was using AI during this task, but I believe it was within bounds where it is more than fine to do so. I did not let it "run wild" and just give me code files for me to paste in (thus there are no line `a` to `b` tagged as AI) -- instead, I used it as a tool to help me clarify how I want to design parts of code, how to make them work together in the long run etc. It served a "consultant" role in a sense, where I used it as a wall to bounce ideas off. It provided second opinion / *expertise* (aka being trained on half the internet) and chimed in for suggestions when I was not sure about something and asked it.
+For `mock.c`, the results are what I would expect. It follows the expected shape of the chart -- that being initial sharp increase in coverage, leading to a plateau. I'd say this shows that the power profiles behave somewhat as expected -- boosted being the best, fast having fuzzed most inputs etc.
 
-If the need arises, I'd be happy to clarify, but I want to make it clear that **I read, thought about, understood and therefore wrote** every line of code in the program (I hope my comments make it clear) -- so I can explain it while it sits fresh in my mind.
+### Results -- `uniq.c`
+
+I produced **3** sets for `uniq.c`. First run was `stdin` mode, and the random generator did not support `\n` in inputs. Its results are
+
+![uniq_g_1](./task_3_experiment/results_uniq_no_newline/experiment_results_uniq_no_newlines.png)
+
+---
+
+This was a let down at first, as I would hope for better coverage, especially when seeing the results on `mock.c`. I looked into the code of `uniq.c` and at first, I though the biggest culprit is that I did not allow newlines in the input. This is because the program is inherently line-oriented and random one-liner inputs without newlines are not exercising the paths mutch. To verify, I've added newline to the generator charset (done in fuzzer script) and ran the suite again.
 
 
-## Project structure
+![uniq_g_2](./task_3_experiment/results_uniq_with_newlines/experiment_results_uniq_with_newlines.png)
 
-Project root (`fuzzer`) has following subdirectories:
+---
 
-* `lib` -- `.rb` source files for all the fuzzer components (split into subdirectories by purpose/what I thought was fine).
+This has improved the start coverage, but it did not have the effect I would hope for. While I still think newlines are essensial for this specific program, it is certainly not the whole story.
 
-* `spec` -- directory with `rspec` tests. Its structure copies `lib` directory, so its more than clear to see what spec maps to what component. As per Task 1 feedback (and to not go mad by debugging end-to-end program runs), I've tried to test each component separately to verify all interesting scenarios are handled gracefully and as I would want. Regarding end-to-end tests, I struggled with coming up with a way to test the binary file without actually running a campaign, so I at least ran it on mock binary which produces various bugs and sanity checked that they were caught and the stats look fine (see `example_fuzz_run`).
+Last test suite I ran was with input set to `file`, which improved the coverage a little bit. I suspect this is by exercising some additional paths (`file` wrapper function).
 
-* `target_programs` -- has `src` and empty `binary` subdirectories. It containes mock `.c` programs that are used in `spec` testing (specifically in runner tests). As per Task 1, binaries for them are not present and will be compiled upon running tests, if they are missing.
+![uniq_g_3](./task_3_experiment/results_uniq_file/experiment_results_uniq_file.png)
 
-## How it works
+### Conclusion
 
->**TL:DR** -- Fuzzer feeds generated inputs into runner -> runner runs target binary with the input -> runner captures output (return code, data streams etc.) -> outputs are handed to oracle chain for classification -> classified output is deduplicated & its input is minimized (if its the first time we see it) --> we update bug & fuzz campaign statistic
+Given that for `mock.c` the fuzzer behaves exactly as expected, I thought about why the same results were not replicated in `uniq.c` and these are my final thoughts + what I think could be done to target this program specifically, but I did not do it because of time or other reasons. If you were to add these things I talk about below, I am fairly certain the graph would be the same as for the `mock.c` file.
 
-Fuzzer has multiple components (described below) and they all come together in `bin/fuzzer`. When campaign is started by entering something like:
-```
-export FUZZED_PROG=target_programs/binary/mock && export RESULT_FUZZ=./example_fuzz_run && export INPUT=stdin && export MINIMIZE=1 && export TIMEOUT=300 && make run
-```
-Fuzzer controller binary `bin/fuzzer` is called. During initialization, it first validates it received all the required env vars (in and out paths) and captures the other ones (this is handled by `lib/config.rb`). 
+#### Why is the coverage low?
 
-After this (still during initialization), we create instances of all the objects (fuzzer components) we will use during the campaign -- these include mainly `@generator`,`@runner`,`@oracle`,`@deduplicator` etc. These correspond to fuzzer components and are described below.
+When looking at `uniq.c`, it seems that exercising different coverage paths requires distinc inputs, but those inputs need to adhere to certain form/structure. What I mean:
 
-A high-level picture of what the fuzzer campaign will do is visible in the `run` method:
+* newlines are crucial, as without them the core of the program never runs, because we consume the 1 line we have and exit.
 
-```Ruby
- def run
-    setup_signal_traps
-    spawn_timeout_thread
-    spawn_minimizer_thread # actually spawns 4 threads
-    run_main_fuzzing_loop
-    shutdown
-  end
-```
+* even with newlines, to exercise different branches, we need to match scenarios such as **multiple lines being the same** (to trigger the `else` block where `repeats` is incremented). this will very rarely (if ever) happen -- I suspect more testing with specific seeds that prime the fuzzer for these patterns would help a lot.
 
-So the fuzzer will first basically just setup graceful shutdown (`setup_signal_traps`), spawn timeout thread which will sleep for the time given by the `TIMEOUT` env var - 10, then stop the campaign.
+* what is almost certainly the biggest roadblock for coverage -- the fact that we just pass in input and do nothing about the flags passed in with `argv`.
 
-In the meantime (until we kill the program or timeout), there are 1+4 threads which do all the work -- `spawn_minimizer_thread` spawns threads on which we minimize inputs of found bugs. `run_main_fuzzing_loop` on the other hand just pipes generated inputs into runner all the time. These threads interface via queue (thread-safe in Ruby) -- main thread pushes any new bugs, and minimize threads try to pop and whenever they can they minimize what they popped. When we are ending campaign, we push `nil` into the queue for each minimize thread so that they end gracefully -- If they are currently working and don't see their `nil` before program dies, they are still killed because our fuzzer exits, but we will lose whatever they were currently minimizing (although we would probably not save partial result anyway?).
+#### What could be done to target this specific program?
 
-Once program is killed / `TIMEOUT` is nearing, we save reports and wrap it up with `shutdown`.
+I think that the best course of action would be to separate and fuzz both flags in `argv` and combine this with fuzzing of data (input) in `file` or `stdin` -- easiest would probably be something like generating inputs of at least size `N`, where these first `N` bytes are gonna encode flags we pass in, then the rest is the input. Furthermore, we could do it so that we can pass seeds to the fuzzer with inputs that would give it these interesting inputs, such as multiple same lines, different lines, flag configs etc. 
 
-## Example campaign
 
-Can be found in `example_fuzz_run`. It was run with the command shown above (mock binary has to be compiled with `make build` first):
+## TODO/Issues
 
-```
-export FUZZED_PROG=target_programs/binary/mock && export RESULT_FUZZ=./example_fuzz_run && export INPUT=stdin && export MINIMIZE=1 && export TIMEOUT=300 && make run
-```
+These are some TODOs deduced from seeing the grader run + things I noted down. If time allows, I'd like to eventually add these before hard deadline. + Known issue I encountered
 
-I went over this as a sanity check when my pipeline did not work, and It seems to me that it is correct, as specific inputs trigger specific bugs (corresponding to `mock.c` logic) as expected + number of crashes and hangs match (5+1) and location in code do as well.
+* **TODO -- Mutation testing** (duh)
 
-## Fuzzer components
+* **TODO -- Make it so splicing is only made once queue goes stale + make it sample based on energy, not randomly** -- this will require to rewrite how sampling works / implement mutation op selection in `bin/fuzzer`, so we have the context to call queue sample.
 
-### `lib/generators/cstring_generator.rb`
+* **TODO -- Make it so that if queue goes stale, we jolt it back up with few random inputs?**
 
-Generates C string inputs for the runner. It can be initialized with specific **min/max length** (0 - 64 by default), **charset** it should use (printable ASCII by default), and **seed** for reproducing sequences (random seed by default), among other parameters.
+* **ISSUE -- program `uniq.c` wont compile in the grader** -- because it contains one-liner conditionals (`if (cond) code;`) without brackets and my code coverage tool does not support this 😅 (nor does it have to, as it is optional feature in task 1 description). By pure chance, I used it in my **experiment** and so I had to modify it, so you can check its results there. 
 
-Once initialized, it provides new `FuzzInput` every time you call its `next` method. Aside from the input itself, it contains metadata such as `seed` used and `iteration` of sequence stemming from this seed.
-
-### `lib/runner/external_runner.rb`
-
-Overseer of every target program execution. It must be initialized with the **path** to target binary. Specific **input mode** (`:stdin` -- default, `:file`, or `:argv`) can be selected in addition to **timeout** threshold.
-
-Upon calling `run(fuzz_input)`, runner takes generated input, feeds it into target program binary and runs it, oversees the whole run and (if need be) kills the program if it timeouts. After the run, it collects and returns `RunResult`, which contains `exit_code`, `stdout`, `stderr`, `wall_time_ms`, and `timed_out` flag.
-
-### `lib/oracle/*.rb`
-
-This directory contains 3 different oracles -- `ASAN`/`ReturnCode`/`Timeout`-`Oracle` -- and `chain.rb`, which is the entrypoint we use to work with them and order their priority (ASAN\>TIMEOUT\>RC).
-
-Each oracle looks for different things -- `Timeout` and `ReturnCode` oracles are straightforward (`Timeout` catches any results where `timed_out` flag is `true`, `ReturnCode` catches any results where `exit_code` is non-zero integer and is not timed out). `ASAN` matches Summary line in the `stderr` and matches stack/heap overflow.
-
-We initialize chain with **timeout** threshold it passes to `TimeoutOracle` (this **timeout** should = **timeout** for the program we passed into runner). We can then call `classify(run_result,fuzz_input)`, which will return `Classification` struct (from one of the oracles, depends which one catches it) denoting what the result should be treated as. If no oracle caught it, it is taken as **passed/no bug**. To recognize what it is, `Classification` struct contains metadata:
-
-  * `:status` (`:pass`, `:hang`, `:fail`)
-
-  * `:oracle` (`:asan`, `:return_code`, `:timeout`, `nil` -- pass)
-
-  * `:bug_info` -- info regarding bug (different for each oracle). `ASAN` reports file, line, and type of bug it caused (heap/stack overflow). `ReturnCode` just passes return code, and `Timeout` passes the threshold for timeout.
-
-  * `:signature` -- string that deduplicator will later use to decide, if 2 `ASAN`/`ReturnCode`/`Timeout` crashes are the same bug instance or not. It is in format `[BUG_TYPE]:[BUG_INFO]` (ex. `asan:stack:myfile:12` or `rc:1`)
-
-### `lib/results/deduplicator.rb`
-
-Class which maintains a set of signatures of discovered bugs.
-
-### `lib/results/results_store.rb` & `lib/results/stats_aggregator.rb`
-
-Classes for writing out results for the whole campaign and individual crashes / hangs. I tried to make this match task description, but from the CI results it seems I did not, although I am almost 100% sure that the results it saves have same informational value, and when running with mock program and then going over the results (see `example_fuzz_run` dir), they seem to be correct.
-
-### `/lib/minimize/ddmin.rb`
-
-Delta-Debugging algorithm for input minimization. It contains the ddmin in `self.run(input_bytes:, bug_observer:)`, where `input_bytes:` param is the input we want to minimize.
-
-`bug_observer:` param is boolean lambda function, which takes in substring from `input_bytes` and simply returns whether the substring causes currently targeted bug for minimization or not **AND** it reports any other bugs to the deduplicator. This is the reason we pass it as parameter into the `run` function -- we need to define it in the context where we also have deduplicator and from which we run the main campaign (`bin/fuzzer`)
-
-### `lib/config.rb` & `bin/fuzzer`
-
-See **How it works** section
+* **ISSUE -- Sometimes, statistics dont save, even though I kill the campaign 10 seconds earlier** -- I have yet to figure this out, because it is not that it does not have time to save it (it ends sooner than after 10 seconds it has dedicated for saving)... it just does not save the file 🥲.

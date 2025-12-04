@@ -54,7 +54,7 @@ class CampaignController
   MINIMIZER_PROCESSES = 2
 
   # How many random inputs to generate if queue is empty
-  BOOTSTRAP_COUNT = 500
+  BOOTSTRAP_COUNT = 1000
 
   def initialize
     @config = Config
@@ -79,9 +79,10 @@ class CampaignController
     log_startup
 
     @hard_timeout = @config.timeout
-
+    # ADD NEWLINE (for interacitve programs?)
+    charset = (0x20..0x7E).to_a + ["\n"]
     # --- Components Init ---
-    @generator = Generators::CstringGenerator.new(min_len: 1, max_len: 1024)
+    @generator = Generators::CstringGenerator.new(min_len: 0, max_len: 4095, charset: charset)
     @runner = Runner::ExternalRunner.new(
       target_path: @target_bin,
       mode: @config.input_mode,
@@ -122,7 +123,7 @@ class CampaignController
   # Entry point
   def run
     # true parallelism (forks) here instead of
-    # fake lying green ruby threads (liars!)
+    # fake lying green ruby threads
     spawn_minimizer_workers
 
     # do all of this after
@@ -266,6 +267,7 @@ class CampaignController
     log_info "No input seeds found. Generating #{BOOTSTRAP_COUNT} random seeds..."
     BOOTSTRAP_COUNT.times do |i|
       input = @generator.next
+      # log_success('NEWLINE IN INPUT') if input.bytes.include?("\n".b)
       process_greybox_input(input, nil)
       print "\r  Generated #{i + 1}/#{BOOTSTRAP_COUNT}..."
     end
@@ -364,6 +366,13 @@ class CampaignController
   def run_main_fuzzing_loop
     log_success('Fuzzer parent process running.')
 
+    # --- HOTFIX START: Experiment Logging ---
+    # csv_filename = "experiment_#{@config.power_schedule}.csv"
+    # exp_log = File.open(csv_filename, 'w')
+    # exp_log.puts('run_id,coverage,time_s,total_lines')
+    # t0_exp = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    # --- HOTFIX END ---
+
     while @running
       begin
         # Manage Workers (Check for results, Assign work)
@@ -372,6 +381,17 @@ class CampaignController
         # Fuzz
         run_one_iteration
         @counter += 1
+
+        # --- HOTFIX START: Log Data ---
+        # Log every X runs
+        if (@counter % 50).zero? && @greybox_mode
+          # current_cov = @coverage_tracker.global_hits.size
+          # elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0_exp
+          # total = @total_instrumented_lines || 0
+          # exp_log.puts("#{@counter},#{current_cov},#{elapsed.round(4)},#{total}")
+          # exp_log.flush if (@counter % 500).zero?
+        end
+        # --- HOTFIX END ---
 
         # Detailed updates for greybox
         if (@counter % 100).zero?
@@ -391,6 +411,9 @@ class CampaignController
         sleep 1
       end
     end
+    # --- HOTFIX START: Cleanup ---
+    # exp_log.close
+    # --- HOTFIX END ---
   end
 
   def run_one_iteration

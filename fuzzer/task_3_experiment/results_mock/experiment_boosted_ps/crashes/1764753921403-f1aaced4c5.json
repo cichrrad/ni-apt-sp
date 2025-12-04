@@ -1,0 +1,16 @@
+{
+  "input": "HRyh7 Fq",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 139,
+    "kind": "heap"
+  },
+  "coverage": 23,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 638,
+    "nb_steps": 53,
+    "execution_time": 797
+  }
+}

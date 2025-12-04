@@ -1,0 +1,26 @@
+{
+  "fuzzer_name": "fuzzy_wuzzy_39901",
+  "fuzzed_program": "target_programs/task3_uniq/",
+  "nb_runs": 28360,
+  "nb_failed_runs": 0,
+  "nb_hanged_runs": 0,
+  "nb_queued_seeds": 8,
+  "coverage": 73,
+  "execution_time": {
+    "average": 10.004478138222849,
+    "median": 10.0,
+    "min": 10,
+    "max": 20
+  },
+  "nb_unique_failures": 0,
+  "minimization": {
+    "before": 0,
+    "avg_steps": 0,
+    "execution_time": {
+      "average": 0,
+      "median": 0,
+      "min": 0,
+      "max": 0
+    }
+  }
+}

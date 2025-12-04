@@ -1,0 +1,16 @@
+{
+  "input": "qc*o",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 129,
+    "kind": "stack"
+  },
+  "coverage": 30,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 52,
+    "nb_steps": 20,
+    "execution_time": 326
+  }
+}

@@ -55,7 +55,6 @@ module Greybox
       update_energies(coverage_tracker)
 
       # Weighted random selection
-      # https://en.wikipedia.org/wiki/Fitness_proportionate_selection
       total_energy = @queue.sum(&:energy)
       target = @rng.rand * total_energy
 

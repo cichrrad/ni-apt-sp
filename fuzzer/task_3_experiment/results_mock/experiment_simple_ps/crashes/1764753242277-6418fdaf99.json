@@ -1,0 +1,16 @@
+{
+  "input": "Skiy",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 150,
+    "kind": "heap"
+  },
+  "coverage": 23,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 2632,
+    "nb_steps": 38,
+    "execution_time": 735
+  }
+}

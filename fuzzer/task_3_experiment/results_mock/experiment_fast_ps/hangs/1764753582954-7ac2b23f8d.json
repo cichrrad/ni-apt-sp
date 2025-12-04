@@ -1,0 +1,12 @@
+{
+  "input": "T",
+  "oracle": "timeout",
+  "bug_info": 1000,
+  "coverage": 30,
+  "execution_time": 1056,
+  "minimization": {
+    "unminimized_size": 4070,
+    "nb_steps": 24,
+    "execution_time": 12869
+  }
+}

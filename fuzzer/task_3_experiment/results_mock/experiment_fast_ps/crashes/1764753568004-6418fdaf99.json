@@ -1,0 +1,16 @@
+{
+  "input": "S_NG",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 150,
+    "kind": "heap"
+  },
+  "coverage": 26,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 2620,
+    "nb_steps": 38,
+    "execution_time": 797
+  }
+}

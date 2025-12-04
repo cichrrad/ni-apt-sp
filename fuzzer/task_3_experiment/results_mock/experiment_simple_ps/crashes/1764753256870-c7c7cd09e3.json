@@ -1,0 +1,16 @@
+{
+  "input": "c1Jbqg00",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 120,
+    "kind": "stack"
+  },
+  "coverage": 23,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 56,
+    "nb_steps": 42,
+    "execution_time": 599
+  }
+}
