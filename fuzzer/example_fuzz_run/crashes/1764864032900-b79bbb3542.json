@@ -1,0 +1,15 @@
+{
+  "input": "nkD ",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 20,
+    "kind": "stack"
+  },
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 6,
+    "nb_steps": 20,
+    "execution_time": 240
+  }
+}

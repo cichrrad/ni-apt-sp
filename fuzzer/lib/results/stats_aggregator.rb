@@ -5,8 +5,6 @@ require 'json'
 module Results
   # Collects and saves all fuzzing campaign statistics.
   class StatsAggregator
-    attr_writer :current_queue_size, :current_coverage
-
     def initialize(fuzzed_program:, fuzzer_name: 'FuzzyWuzzy')
       raise ArgumentError, 'fuzzer_name cannot be empty' if fuzzer_name.nil? || fuzzer_name.empty?
 
@@ -78,8 +76,6 @@ module Results
           nb_runs: @nb_runs,
           nb_failed_runs: @nb_failed_runs,
           nb_hanged_runs: @nb_hanged_runs,
-          nb_queued_seeds: @current_queue_size || 0,
-          coverage: @current_coverage || 0,
           execution_time: calculate_timings(@execution_times_ms),
           nb_unique_failures: @nb_unique_failures,
           minimization: calculate_minimization_stats

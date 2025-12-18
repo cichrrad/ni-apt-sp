@@ -1,13 +1,11 @@
 {
   "fuzzer_name": "fuzzy_wuzzy_39901",
-  "fuzzed_program": "target_programs/greybox_test/",
-  "nb_runs": 1905,
-  "nb_failed_runs": 494,
-  "nb_hanged_runs": 103,
-  "nb_queued_seeds": 12,
-  "coverage": 33,
+  "fuzzed_program": "target_programs/binary/mock",
+  "nb_runs": 10943,
+  "nb_failed_runs": 2664,
+  "nb_hanged_runs": 94,
   "execution_time": {
-    "average": 72.71811023622047,
+    "average": 25.98565292881294,
     "median": 10.0,
     "min": 10,
     "max": 1059
@@ -15,12 +13,12 @@
   "nb_unique_failures": 7,
   "minimization": {
     "before": 7,
-    "avg_steps": 145,
+    "avg_steps": 147,
     "execution_time": {
-      "average": 9095.57142857143,
-      "median": 641.0,
-      "min": 156,
-      "max": 50842
+      "average": 5917.142857142857,
+      "median": 706.0,
+      "min": 208,
+      "max": 28210
     }
   }
 }

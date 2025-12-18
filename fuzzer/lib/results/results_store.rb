@@ -23,14 +23,13 @@ module Results
     # Save report for new bug
     def save_report(classification:,
                     run_result:,
-                    minimized_input:, unminimized_size:, min_result: nil, coverage: 0)
+                    minimized_input:, unminimized_size:, min_result: nil)
       report = build_report(
         classification: classification,
         run_result: run_result,
         min_result: min_result,
         minimized_input: minimized_input,
-        unminimized_size: unminimized_size,
-        coverage: coverage
+        unminimized_size: unminimized_size
       )
 
       # Where to place ?
@@ -44,12 +43,11 @@ module Results
 
     private
 
-    def build_report(classification:, run_result:, min_result:, minimized_input:, unminimized_size:, coverage:)
+    def build_report(classification:, run_result:, min_result:, minimized_input:, unminimized_size:)
       report = {
         input: minimized_input,
         oracle: classification.oracle.to_s,
         bug_info: classification.bug_info,
-        coverage: coverage,
         execution_time: run_result.wall_time_ms
       }
 

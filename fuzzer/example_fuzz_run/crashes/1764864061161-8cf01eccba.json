@@ -1,0 +1,11 @@
+{
+  "input": "h3Noq}%%\"\" Dl\\Se/RH#q&nECl@ Z2p6bO> _*Y=*Dg30)$h+nSDMjGCHPzly&.(!l}viHlx%%7nbzp%wL><:D*QtV-k&Ft1;VW _Ul.SBC0t.a$x**I(<z(Z274&_!tn`OrHQL|(yu:Xj['BC4\\eaHZP|ytuwhe':epu-G}pee(Jv|T",
+  "oracle": "return_code",
+  "bug_info": 1,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 374,
+    "nb_steps": 844,
+    "execution_time": 28210
+  }
+}
