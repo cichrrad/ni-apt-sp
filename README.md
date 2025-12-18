@@ -27,15 +27,15 @@ This is the reason in the `Makefile`, launch commands are prepended with `setarc
 
 Without this option, it's 50/50 shot of the program (the compiled binary we are fuzzing) running or ASAN exploding and killing it, stoping the fuzzer in its tracks. To be honest, I have little idea or will to figure out what & why is going on exactly. It may very well run OK without the flag on your system.
 
-# TODO UPDATE TEXT BELOW TO REFLECT LATEST CHANGES
-
 ## Project structure
 
 Project root (`fuzzer`) has following subdirectories:
 
 * `lib` -- `.rb` source files for all the fuzzer components (split into subdirectories by purpose/what I thought was fine).
 
-* `spec` -- directory with `rspec` tests. Its structure copies `lib` directory, so its more than clear to see what spec maps to what component. As per Task 1 feedback (and to not go mad by debugging end-to-end program runs), I've tried to test each component separately to verify all interesting scenarios are handled gracefully and as I would want. Regarding end-to-end tests, I struggled with coming up with a way to test the binary file without actually running a campaign, so I at least ran it on mock binary which produces various bugs and sanity checked that they were caught and the stats look fine (see `example_fuzz_run`).
+* `spec` -- directory with `rspec` tests. Its structure copies `lib` directory, so its more than clear to see what spec maps to what component. I've tried to test each component separately to verify all interesting scenarios are handled gracefully and as I would want. Regarding end-to-end tests, I struggled with coming up with a way to test the binary file without actually running a campaign, so I at least ran it on mock binary which produces various bugs and sanity checked that they were caught and the stats look fine (see `example_fuzz_run`).
+
+  > Potential TODO -- aruba gem e2e?
 
 * `target_programs` -- has `src` and empty `binary` subdirectories. It containes mock `.c` programs that are used in `spec` testing (specifically in runner tests). As per Task 1, binaries for them are not present and will be compiled upon running tests, if they are missing.
 
@@ -47,27 +47,72 @@ Fuzzer has multiple components (described below) and they all come together in `
 ```
 export FUZZED_PROG=target_programs/binary/mock && export RESULT_FUZZ=./example_fuzz_run && export INPUT=stdin && export MINIMIZE=1 && export TIMEOUT=300 && make run
 ```
-Fuzzer controller binary `bin/fuzzer` is called. During initialization, it first validates it received all the required env vars (in and out paths) and captures the other ones (this is handled by `lib/config.rb`). 
+Fuzzer controller executable script `bin/fuzzer` is called. During initialization, it first validates it received all the required env vars (in and out paths) and captures the other ones (this is handled by `lib/config.rb`). 
 
 After this (still during initialization), we create instances of all the objects (fuzzer components) we will use during the campaign -- these include mainly `@generator`,`@runner`,`@oracle`,`@deduplicator` etc. These correspond to fuzzer components and are described below.
 
-A high-level picture of what the fuzzer campaign will do is visible in the `run` method:
+A high-level picture of what the fuzzer campaign will do is visible in the `run` method (entry point for the whole campaign):
 
-```Ruby
- def run
+```ruby
+  def run
+    spawn_minimizer_workers
     setup_signal_traps
     spawn_timeout_thread
-    spawn_minimizer_thread # actually spawns 4 threads
-    run_main_fuzzing_loop
-    shutdown
+
+    begin
+      run_main_fuzzing_loop
+    ensure
+      stop
+    end
   end
 ```
 
-So the fuzzer will first basically just setup graceful shutdown (`setup_signal_traps`), spawn timeout thread which will sleep for the time given by the `TIMEOUT` env var - 10, then stop the campaign.
+The fuzzer will populate worker pool with forked processes that will run minimizing (`spawn_minimizer_workers`), setup signal traps to catch `CTRL+C` and shutdown signals, spawn timeout thread which will sleep for the time given by the `TIMEOUT` env var - 10 (buffer to ensure we save stats), then stop the campaign. In the meantime (until we kill the program or `TIMEOUT - 10` seconds pass), there are 1 fuzzing + 2 (by default) minimizer processes which do all the work. This is orchestrated in `run_main_fuzzing_loop`:
 
-In the meantime (until we kill the program or timeout), there are 1+4 threads which do all the work -- `spawn_minimizer_thread` spawns threads on which we minimize inputs of found bugs. `run_main_fuzzing_loop` on the other hand just pipes generated inputs into runner all the time. These threads interface via queue (thread-safe in Ruby) -- main thread pushes any new bugs, and minimize threads try to pop and whenever they can they minimize what they popped. When we are ending campaign, we push `nil` into the queue for each minimize thread so that they end gracefully -- If they are currently working and don't see their `nil` before program dies, they are still killed because our fuzzer exits, but we will lose whatever they were currently minimizing (although we would probably not save partial result anyway?).
+```ruby
+  def run_main_fuzzing_loop
+    @reporter.log_success('Fuzzer parent process running.')
 
-Once program is killed / `TIMEOUT` is nearing, we save reports and wrap it up with `shutdown`.
+    while @running
+      begin
+        # Manage Workers (Check for results, Assign work)
+        process_worker_events
+        distribute_work
+        # Fuzz
+        run_one_iteration
+        @counter += 1
+        @reporter.log_info("Fuzzed #{@counter} inputs.") if (@counter % 100).zero?
+      rescue StandardError => e
+        @reporter.log_error("Parent Loop Error: #{e.message}\n#{e.backtrace.join("\n")}")
+        sleep 1
+      end
+    end
+  end
+``` 
+This describes the **fuzzing process loop**. It is responsible for running the target binary with random generated inputs (`run_one_iteration`), as well as processing events that come from the minimizer processes -- either `:minimization_success` or `:new_bug_found` messages (in `process_worker_events`). Lastly, it manages the work distribution between the minimizers (`distribute_work`). This is done by maintaining `@pending_work` array of inputs that cause hang/crash and are in need of minimizing. Whether a worker is free or not is managed via flag `:busy`, which is set/unset upon sending work/recieving `:minimization_success` event. Minimizers run the target binary with provided input and preform delta-debugging minimization. Once program is killed / `TIMEOUT` is nearing, we save reports and wrap it up with `stop` (`shutdown_stats` inside).
+
+Inside `run_one_iteration`, we generate new input, run the target binary with it, use oracle chain to classify it (hang/crash/success) and IF it was not a success, we add it to the array of work pending for minimization. 
+
+```ruby
+  def run_one_iteration
+    input = @generator.next
+    result = @runner.run(input)
+    classification = @oracle.classify(result, input)
+
+    @stats.record_run(result, classification)
+
+    return if classification.pass?
+
+    # Deduplicate
+    return unless @deduplicator.add(classification.signature)
+
+    @reporter.log_new_bug(classification)
+    @stats.record_new_discovery
+
+    # Queue for minimization
+    @pending_work << [input, result, classification]
+  end
+```
 
 ## Example campaign
 
@@ -76,8 +121,6 @@ Can be found in `example_fuzz_run`. It was run with the command shown above (moc
 ```
 export FUZZED_PROG=target_programs/binary/mock && export RESULT_FUZZ=./example_fuzz_run && export INPUT=stdin && export MINIMIZE=1 && export TIMEOUT=300 && make run
 ```
-
-I went over this as a sanity check when my pipeline did not work, and It seems to me that it is correct, as specific inputs trigger specific bugs (corresponding to `mock.c` logic) as expected + number of crashes and hangs match (5+1) and location in code do as well.
 
 ## Fuzzer components
 
@@ -122,6 +165,18 @@ Classes for writing out results for the whole campaign and individual crashes / 
 Delta-Debugging algorithm for input minimization. It contains the ddmin in `self.run(input_bytes:, bug_observer:)`, where `input_bytes:` param is the input we want to minimize.
 
 `bug_observer:` param is boolean lambda function, which takes in substring from `input_bytes` and simply returns whether the substring causes currently targeted bug for minimization or not **AND** it reports any other bugs to the deduplicator. This is the reason we pass it as parameter into the `run` function -- we need to define it in the context where we also have deduplicator and from which we run the main campaign (`bin/fuzzer`)
+
+### `lib/minimize/worker_pool.rb`
+
+*Forking Server*. It spawns the minimizers processes, sets up IO, and cleans up after. It wraps `IO.select` so the main fuzzing loop can query stuff like free workers and new messages.
+
+### `lib/cli/reporter.rb`
+
+Pretty printer using `colorize` gem :).
+
+### `lib/ipc/protocol.rb`
+
+Communication between the parent fuzzer and the worker processes. Since this is over pipes (streams of bytes), I used a micro protocol with lenght-prefix. It takes a Ruby object, serializes it using `Marshal` (AI suggestion, I did not know of this), and prepends a 4-byte header indicating the size of the payload.
 
 ### `lib/config.rb` & `bin/fuzzer`
 
