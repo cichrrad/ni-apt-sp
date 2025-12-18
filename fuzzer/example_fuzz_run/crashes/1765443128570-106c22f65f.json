@@ -1,15 +1,15 @@
 {
-  "input": "h+njGCPz",
+  "input": "aw0fPzGO",
   "oracle": "asan",
   "bug_info": {
     "file": "mock.c",
     "line": 11,
     "kind": "stack"
   },
-  "execution_time": 40,
+  "execution_time": 60,
   "minimization": {
-    "unminimized_size": 94,
-    "nb_steps": 47,
-    "execution_time": 766
+    "unminimized_size": 120,
+    "nb_steps": 36,
+    "execution_time": 787
   }
 }

@@ -1,15 +1,15 @@
 {
-  "input": "SS96",
+  "input": "SU.j",
   "oracle": "asan",
   "bug_info": {
     "file": "mock.c",
     "line": 41,
     "kind": "heap"
   },
-  "execution_time": 40,
+  "execution_time": 60,
   "minimization": {
-    "unminimized_size": 826,
-    "nb_steps": 28,
-    "execution_time": 588
+    "unminimized_size": 236,
+    "nb_steps": 24,
+    "execution_time": 709
   }
 }

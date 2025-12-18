@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require 'tempfile'
-require 'pry'
 
 # Single run result struct
 RunResult = Struct.new(:exit_code, :stdout, :stderr, :wall_time_ms, :timed_out, keyword_init: true)

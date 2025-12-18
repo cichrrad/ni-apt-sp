@@ -1,6 +1,6 @@
 BUNDLE = bundle
 RUBY = setarch $(uname -m) -R ruby
-RSPEC = setarch $(uname -m) -R $(BUNDLE) exec rspec
+RSPEC = setarch $(uname -m) -R $(BUNDLE) exec rspec --format documentation
 # RUBY = ruby
 # RSPEC = $(BUNDLE) exec rspec
 FUZZER = bin/fuzzer

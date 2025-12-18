@@ -4,8 +4,8 @@
   "bug_info": 42,
   "execution_time": 10,
   "minimization": {
-    "unminimized_size": 992,
-    "nb_steps": 20,
-    "execution_time": 208
+    "unminimized_size": 68,
+    "nb_steps": 14,
+    "execution_time": 170
   }
 }

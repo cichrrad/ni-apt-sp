@@ -1,15 +1,15 @@
 {
-  "input": "HHnk<(D ",
+  "input": "Hg1I/$\"r",
   "oracle": "asan",
   "bug_info": {
     "file": "mock.c",
     "line": 30,
     "kind": "heap"
   },
-  "execution_time": 40,
+  "execution_time": 60,
   "minimization": {
-    "unminimized_size": 69,
+    "unminimized_size": 323,
     "nb_steps": 50,
-    "execution_time": 706
+    "execution_time": 1143
   }
 }

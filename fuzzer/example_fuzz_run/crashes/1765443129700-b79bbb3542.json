@@ -1,15 +1,15 @@
 {
-  "input": "nkD ",
+  "input": "oZ+p",
   "oracle": "asan",
   "bug_info": {
     "file": "mock.c",
     "line": 20,
     "kind": "stack"
   },
-  "execution_time": 40,
+  "execution_time": 60,
   "minimization": {
-    "unminimized_size": 6,
-    "nb_steps": 20,
-    "execution_time": 240
+    "unminimized_size": 60,
+    "nb_steps": 19,
+    "execution_time": 477
   }
 }
