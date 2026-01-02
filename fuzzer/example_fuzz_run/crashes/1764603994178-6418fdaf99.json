@@ -1,0 +1,16 @@
+{
+  "input": "S)If",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 150,
+    "kind": "heap"
+  },
+  "coverage": 25,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 8,
+    "nb_steps": 14,
+    "execution_time": 186
+  }
+}

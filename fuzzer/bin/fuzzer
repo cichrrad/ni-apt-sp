@@ -17,9 +17,30 @@ require 'results/deduplicator'
 require 'results/stats_aggregator'
 require 'results/results_store'
 require 'minimize/ddmin'
-require 'minimize/worker_pool'
-require 'ipc/protocol'
-require 'cli/reporter'
+
+# --- Greybox Components ---
+require 'greybox/seed'
+require 'greybox/seed_queue'
+require 'greybox/coverage_tracker'
+require 'greybox/mutator'
+
+# task 1 imports
+COV_LIB = File.expand_path('../../code-coverage/src', __dir__)
+$LOAD_PATH.unshift(COV_LIB)
+
+# Load task 1
+begin
+  require 'FileModel'
+  require 'Analyzer'
+  require 'Instrumentor'
+  require 'tree_sitter'
+  require 'tree_stand'
+rescue LoadError
+  # bad practice
+end
+
+# Used to track worker state in the Parent
+WorkerSlot = Struct.new(:pid, :work_w, :stats_r, :busy, :id, keyword_init: true)
 
 # Brain of the operation
 # Orchestrates the Fuzzing Campaign and manages
@@ -32,22 +53,41 @@ class CampaignController
   # (These are now real forks, not threads!)
   MINIMIZER_PROCESSES = 2
 
+  # How many random inputs to generate if queue is empty
+  BOOTSTRAP_COUNT = 100
+
   def initialize
     @config = Config
     @config.validate!
-    @reporter = CLI::Reporter.new
-    @reporter.log_startup(@config, MINIMIZER_PROCESSES)
+    @shm_config = nil # Default Blackbox
+    @greybox_mode = (@config.fuzzer_type == :greybox)
+
+    # TASK 3 : Check if we need to compile
+    if File.directory?(@config.fuzzed_program)
+      raise StandardError, 'blackbox must be run on pre-compiled binary' unless @greybox_mode
+
+      compile_target(@config.fuzzed_program)
+    else
+      if @greybox_mode
+        raise StandardError,
+              'greybox must instrument and compile the program, dont provide binary for it'
+      end
+
+      @target_bin = @config.fuzzed_program
+    end
+
+    log_startup
 
     @hard_timeout = @config.timeout
-
-    raise StandardError, 'FUZZER_PROG must be point to pre-compiled C binary' if File.directory?(@config.fuzzed_program)
-
+    # ADD NEWLINE (for interacitve programs?)
+    charset = (0x20..0x7E).to_a + ["\n"]
     # --- Components Init ---
-    @generator = Generators::CstringGenerator.new(min_len: 1, max_len: 1024)
+    @generator = Generators::CstringGenerator.new(min_len: 0, max_len: 4095, charset: charset)
     @runner = Runner::ExternalRunner.new(
-      target_path: @config.fuzzed_program,
+      target_path: @target_bin,
       mode: @config.input_mode,
-      run_timeout_ms: RUN_TIMEOUT_MS
+      run_timeout_ms: RUN_TIMEOUT_MS,
+      shm_config: @shm_config
     )
     @oracle = Oracle::Chain.new(run_timeout_ms: RUN_TIMEOUT_MS)
     @deduplicator = Results::Deduplicator.new
@@ -57,19 +97,33 @@ class CampaignController
     )
     @store = Results::ResultsStore.new(root_dir: @config.result_dir)
 
+    # --- Greybox Init ---
+    if @greybox_mode
+
+      @seed_queue = Greybox::SeedQueue.new(
+        result_dir: @config.result_dir,
+        power_schedule: @config.power_schedule
+      )
+      @coverage_tracker = Greybox::CoverageTracker.new
+      @mutator = Greybox::Mutator.new
+    end
+
     # --- State ---
     @running = true
     @counter = 0
 
     # work waiting for a free worker
+    # cannot be ruby Queue anymore :(
     @pending_work = []
 
-    # worker pool
-    @pool = Minimization::WorkerPool.new(MINIMIZER_PROCESSES)
+    # Array of WorkerSlot structs
+    @workers = []
   end
 
   # Entry point
   def run
+    # true parallelism (forks) here instead of
+    # fake lying green ruby threads
     spawn_minimizer_workers
 
     # do all of this after
@@ -77,6 +131,9 @@ class CampaignController
     # inherit sig traps
     setup_signal_traps
     spawn_timeout_thread
+
+    # TASK 3: Bootstrap if Greybox
+    bootstrap_queue if @greybox_mode
 
     begin
       run_main_fuzzing_loop
@@ -88,27 +145,226 @@ class CampaignController
   private
 
   # ---------------------------------------------------------
+  # TASK 3 PROGRAM COMPILATION & SHARED MEM SETUP
+  # ---------------------------------------------------------
+
+  def compile_target(source_dir)
+    source_dir = File.expand_path(source_dir)
+
+    log_info "Greybox Mode: Instrumenting source from #{source_dir}..."
+
+    # Setup TreeStand
+    TreeStand.configure { config.parser_path = '.' }
+    parser = TreeStand::Parser.new('c')
+    analyzer = Analyzer.new
+    inst = Instrumentor.new
+
+    # Analyze (SORTED for Determinism in shared mem layout !!!)
+    files = Dir.glob(File.join(source_dir, '**', '*.c')).sort
+    file_models = []
+    file_plans = []
+    total_slots = 0
+    total_instrumented = 0
+
+    files.each do |p|
+      src = File.binread(p)
+      fm = FileModel.new(path: p, src: src, parser: parser)
+      plan = analyzer.analyze(fm)
+      file_models << fm
+      file_plans << plan
+      total_slots += (plan.nlines + 1)
+      total_instrumented += plan.instrument_lines.size
+    end
+
+    inst.plan_edits(file_models: file_models, file_plans: file_plans)
+    results = inst.instrument_files
+
+    # Create Temp Build Dir
+    build_dir = Dir.mktmpdir('apt_greybox_build')
+    # Cleanup at exit
+    at_exit do
+      FileUtils.remove_entry(build_dir)
+    rescue StandardError
+      nil # bad practice
+    end
+
+    results.each do |r|
+      rel = Pathname.new(r[:path]).relative_path_from(source_dir)
+      dest = File.join(build_dir, rel.to_s)
+      FileUtils.mkdir_p(File.dirname(dest))
+      File.binwrite(dest, r[:out])
+    end
+
+    # Copy headers too
+    Dir.glob(File.join(source_dir, '**', '*.h')).each do |h|
+      rel = Pathname.new(h).relative_path_from(source_dir)
+      dest = File.join(build_dir, rel.to_s)
+      FileUtils.mkdir_p(File.dirname(dest))
+      FileUtils.cp(h, dest)
+    end
+
+    # Compile (ASAN)
+    bin_path = File.join(build_dir, 'fuzz_target')
+    # Find all .c files in build dir
+    c_files = Dir.glob(File.join(build_dir, '**', '*.c'))
+
+    # Compilation command
+    cmd = "gcc -O0 -g -fsanitize=address -fno-omit-frame-pointer #{c_files.join(' ')} -o #{bin_path}"
+
+    log_info 'Compiling...'
+    raise "Compilation failed: #{cmd}" unless system(cmd)
+
+    @total_instrumented_lines = total_instrumented
+    log_success "Compiled successfully. SHM Size: #{total_slots} slots. Instr: #{total_instrumented}"
+
+    @target_bin = bin_path
+
+    # Initialize Shared Memory (/dev/shm)
+    # Using PID to avoid collision
+    shm_path = "/dev/shm/apt_shm_parent_#{$$}" # rubocop:disable Style/SpecialGlobalVars
+    create_shm_file(shm_path, total_slots)
+
+    # removed at exit
+    at_exit do
+      File.unlink(shm_path)
+    rescue StandardError
+      nil
+    end
+
+    @shm_config = { path: shm_path, size: total_slots }
+  end
+
+  def create_shm_file(path, slots)
+    File.open(path, 'w+b') do |f|
+      f.truncate(slots * 8) # 8 bytes for 64-bit unsigned long
+    end
+  end
+
+  # ---------------------------------------------------------
+  # TASK 3: Greybox Bootstrap
+  # ---------------------------------------------------------
+
+  def bootstrap_queue
+    log_info 'Bootstrapping Greybox Queue...'
+    log_info "Using #{@config.power_schedule} schedule"
+    # Load Seeds if provided
+    if @config.input_seeds && Dir.exist?(@config.input_seeds)
+      files = Dir.glob(File.join(@config.input_seeds, '*')).select { |f| File.file?(f) }
+      unless files.empty?
+        log_info "Loading #{files.size} seeds from #{@config.input_seeds}..."
+        files.each do |f|
+          # just read as binary blobs
+          # (from what I found this is common practice?)
+          data = File.binread(f)
+          # We must run them to get coverage/energy stats
+          process_greybox_input(FuzzInput.new(bytes: data), nil)
+        end
+        return
+      end
+    end
+
+    # Fallback: Generate substantial amount of random seeds to kick start the fuzzer
+    log_info "No input seeds found. Generating #{BOOTSTRAP_COUNT} random seeds..."
+    BOOTSTRAP_COUNT.times do |i|
+      input = @generator.next
+      # log_success('NEWLINE IN INPUT') if input.bytes.include?("\n".b)
+      process_greybox_input(input, nil)
+      print "\r  Generated #{i + 1}/#{BOOTSTRAP_COUNT}..."
+    end
+    puts '' # pretty newline
+    log_success "Bootstrap complete. Queue size: #{@seed_queue.size}"
+  end
+
+  # ---------------------------------------------------------
   # Process Management & IPC Setup
   # ---------------------------------------------------------
 
   def spawn_minimizer_workers
-    @reporter.log_info("Forking #{MINIMIZER_PROCESSES} minimizer processes...")
+    log_info("Forking #{MINIMIZER_PROCESSES} minimizer processes...")
 
-    @pool.start! do |id, work_r, stats_w|
-      minimizer_worker_loop(id, work_r, stats_w)
+    MINIMIZER_PROCESSES.times do |i|
+      # Create separate pipes for each worker to avoid interleaving issues
+      # Parent -> Child (Work)
+      work_r, work_w = IO.pipe
+      # Child -> Parent (Stats/Events)
+      stats_r, stats_w = IO.pipe
+
+      work_w.binmode
+      stats_w.binmode
+
+      # --- CHILD PROCESS ---
+      pid = fork do
+        # shut child up
+        Signal.trap('INT') { exit!(0) }
+        Signal.trap('TERM') { exit!(0) }
+        # Close unused ends
+        work_w.close
+        stats_r.close
+        # Run the worker logic (point of no return)
+        minimizer_worker_loop(i + 1, work_r, stats_w)
+      end
+      # --- END CHILD ---
+
+      # Close unused ends
+      work_r.close
+      stats_w.close
+
+      @workers << WorkerSlot.new(
+        pid: pid,
+        work_w: work_w,
+        stats_r: stats_r,
+        busy: false,
+        id: i + 1
+      )
     end
   end
 
   def stop
+    # Guard clause to prevent double-execution
     return unless @running
 
-    puts
-    @reporter.log_warn('Stopping fuzz loop and cleaning up...')
+    puts # pretty newline after ^C
+    log_warn('Stopping fuzz loop and cleaning up...')
     @running = false
 
+    # moved here to prevent race condition
+    # hopefully
     shutdown_stats
 
-    @pool.shutdown
+    # Kill workers explicitly
+    @workers.each do |worker|
+      Process.kill('TERM', worker.pid)
+    rescue Errno::ESRCH
+      # Already dead, ignore
+    end
+
+    # try to wait for workers
+    @workers.each do |worker|
+      Process.waitpid(worker.pid)
+    rescue Errno::ECHILD, Errno::ESRCH
+      # Already reaped or didn't exist
+    end
+
+    # Close pipes
+    @workers.each do |w|
+      begin
+        w.work_w.close
+      rescue StandardError
+        nil
+      end
+      begin
+        w.stats_r.close
+      rescue StandardError
+        nil
+      end
+    end
+
+    # final stats
+    # this might be causing the race condition
+    # as we might not get here if workers
+    # refuse to die ????
+    # ==> MOVED UP
+    # shutdown_stats
   end
 
   # ---------------------------------------------------------
@@ -116,7 +372,14 @@ class CampaignController
   # ---------------------------------------------------------
 
   def run_main_fuzzing_loop
-    @reporter.log_success('Fuzzer parent process running.')
+    log_success('Fuzzer parent process running.')
+
+    # --- HOTFIX START: Experiment Logging ---
+    # csv_filename = "experiment_#{@config.power_schedule}.csv"
+    # exp_log = File.open(csv_filename, 'w')
+    # exp_log.puts('run_id,coverage,time_s,total_lines')
+    # t0_exp = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    # --- HOTFIX END ---
 
     while @running
       begin
@@ -126,31 +389,121 @@ class CampaignController
         # Fuzz
         run_one_iteration
         @counter += 1
-        @reporter.log_info("Fuzzed #{@counter} inputs.") if (@counter % 100).zero?
+
+        # save stats every now and then
+        save_stats_snapshot if (@counter % 500).zero?
+
+        # --- HOTFIX START: Log Data ---
+        # Log every X runs
+        # if (@counter % 50).zero? && @greybox_mode
+        # current_cov = @coverage_tracker.global_hits.size
+        # elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0_exp
+        # total = @total_instrumented_lines || 0
+        # exp_log.puts("#{@counter},#{current_cov},#{elapsed.round(4)},#{total}")
+        # exp_log.flush if (@counter % 500).zero?
+        # end
+        # --- HOTFIX END ---
+
+        # Detailed updates for greybox
+        if (@counter % 100).zero?
+          if @greybox_mode
+            # Calculate percentage
+            cov = @coverage_tracker.global_hits.size
+            total = @total_instrumented_lines || 1 # avoid div by zero
+            pct = (cov.to_f / total * 100).round(1)
+
+            log_info("Fuzzed #{@counter}. Queue: #{@seed_queue.size} Cov: #{cov}/#{total} (#{pct}%)")
+          else
+            log_info("Fuzzed #{@counter} inputs.")
+          end
+        end
       rescue StandardError => e
-        @reporter.log_error("Parent Loop Error: #{e.message}\n#{e.backtrace.join("\n")}")
+        log_error("Parent Loop Error: #{e.message}\n#{e.backtrace.join("\n")}")
         sleep 1
       end
     end
+    # --- HOTFIX START: Cleanup ---
+    # exp_log.close
+    # --- HOTFIX END ---
   end
 
   def run_one_iteration
-    input = @generator.next
-    result = @runner.run(input)
-    classification = @oracle.classify(result, input)
+    # Decide Input Source
+    parent_seed = nil
+    input = nil
 
+    if @greybox_mode
+      # Select Parent
+      parent_seed = @seed_queue.sample(@coverage_tracker)
+
+      if parent_seed
+        # Mutate
+        mutated_data = @mutator.mutate(parent_seed.data, @seed_queue)
+        input = FuzzInput.new(bytes: mutated_data)
+      else
+        # Fallback if queue empty
+        # (should not happen almost at all)
+        input = @generator.next
+      end
+
+      # Process
+      process_greybox_input(input, parent_seed)
+    else
+      # Blackbox Mode (Legacy)
+      input = @generator.next
+      result = @runner.run(input)
+      handle_result(input, result)
+    end
+  end
+
+  # Helper for execution + Greybox logic
+  def process_greybox_input(input, parent_seed)
+    result = @runner.run(input)
+
+    # Check Coverage
+    is_cov_interesting, path_hash = @coverage_tracker.interesting?(result.coverage)
+
+    # Check for Crashes/Hangs (AND if they are new)
+    # This also handles queuing them for minimization
+    is_bug_interesting = handle_result(input, result)
+
+    # If Interesting (Cov OR New Bug) -> Add to Queue
+    if is_cov_interesting || is_bug_interesting
+      new_seed = Greybox::Seed.new(
+        data: input.bytes,
+        coverage_hash: path_hash,
+        exec_time_ms: result.wall_time_ms
+      )
+      @seed_queue.add(new_seed)
+
+      parent_seed.stats.new_coverage_count += 1 if parent_seed && is_cov_interesting
+    end
+
+    # Always update Parent stats (if exists)
+    # (it might not exist if we pulled the input out of thin air
+    # -- when we fallback to random gen)
+    parent_seed.stats.mutation_count += 1 if parent_seed
+  end
+
+  # Shared Crash/Hang Handler
+  # Returns TRUE if it was a NEW bug, FALSE otherwise
+  def handle_result(input, result)
+    classification = @oracle.classify(result, input)
     @stats.record_run(result, classification)
 
-    return if classification.pass?
+    return false if classification.pass?
 
-    # Deduplicate
-    return unless @deduplicator.add(classification.signature)
+    # Deduplicate: Returns true if NEW, false if SEEN
+    if @deduplicator.add(classification.signature)
+      log_new_bug(classification)
+      @stats.record_new_discovery
 
-    @reporter.log_new_bug(classification)
-    @stats.record_new_discovery
+      # Queue for minimization
+      @pending_work << [input, result, classification]
+      return true # It IS interesting (new bug)
+    end
 
-    # Queue for minimization
-    @pending_work << [input, result, classification]
+    false # Not interesting (duplicate bug)
   end
 
   # ---------------------------------------------------------
@@ -159,11 +512,23 @@ class CampaignController
 
   # Checks all worker pipes for incoming messages
   def process_worker_events
-    # Pool handles the select() logic
-    events = @pool.poll_events
+    # Get all readable stats pipes
+    readable_pipes = @workers.map(&:stats_r)
 
-    events.each do |event|
-      handle_worker_message(event[:worker], event[:message])
+    # NON-blocking select
+    ready, = IO.select(readable_pipes, nil, nil, 0)
+    return unless ready
+
+    ready.each do |pipe|
+      # Find which worker this pipe belongs to
+      worker = @workers.find { |w| w.stats_r == pipe }
+      next unless worker
+
+      msg = read_ipc_message(pipe)
+      # Pipe closed or error
+      next if msg.nil?
+
+      handle_worker_message(worker, msg)
     end
   end
 
@@ -171,11 +536,13 @@ class CampaignController
   def handle_worker_message(worker, msg)
     case msg[:type]
     when :minimization_success
+      # Worker finished a job
       save_worker_result(msg)
-      @pool.mark_free(worker.id)
+      worker.busy = false # Mark available
     when :new_bug_found
+      # Worker found a "new" crash while minimizing
       handle_side_effect_bug(msg)
-      # Do NOT mark free here, it is still working on the original job
+      # still busy with original task
     end
   end
 
@@ -183,14 +550,15 @@ class CampaignController
   def distribute_work
     return if @pending_work.empty?
 
-    # Pool gives us the ready workers
-    @pool.idle_workers.each do |worker|
+    # Find free workers
+    free_workers = @workers.reject(&:busy)
+
+    free_workers.each do |worker|
       break if @pending_work.empty?
 
       work_item = @pending_work.shift
-
-      # Pool handles the IPC sending
-      @pool.schedule_work(worker, work_item)
+      worker.busy = true
+      send_ipc_message(worker.work_w, work_item)
     end
   end
 
@@ -199,18 +567,18 @@ class CampaignController
   # ---------------------------------------------------------
 
   def save_worker_result(msg)
-    #
     @store.save_report(
       classification: msg[:classification],
       run_result: msg[:run_result],
       minimized_input: msg[:minimized_input],
       unminimized_size: msg[:original_size],
-      min_result: msg[:min_stats]
+      min_result: msg[:min_stats],
+      coverage: @greybox_mode ? @coverage_tracker.global_hits.size : 0
     )
-    @stats.record_minimization(msg[:min_stats])
+    @stats.record_minimization(msg[:min_stats]) if msg[:min_stats]
     @stats.record_saved_report
 
-    @reporter.log_minimization_done(msg[:classification], msg[:original_size], msg[:minimized_input].bytesize)
+    log_minimization_done(msg[:classification], msg[:original_size], msg[:minimized_input].bytesize)
   end
 
   def handle_side_effect_bug(msg)
@@ -218,17 +586,40 @@ class CampaignController
     # Check deduplicator (Parent's copy is the valid one)
     return unless @deduplicator.add(cls.signature)
 
-    @reporter.log_new_bug_during_min(cls)
+    log_new_bug_during_min(cls)
     @stats.record_new_discovery
     # Add to work queue
     @pending_work << [msg[:input], msg[:run_result], cls]
   end
 
-  def shutdown_stats
-    @reporter.log_warn('Shutting down. Saving final statistics...')
+  # periodical save to stats helper
+  # not ideal, but should prevent
+  # randomly not saving stats due
+  # to some race condition I've yet
+  # to figure out
+  def save_stats_snapshot
+    if @greybox_mode
+      @stats.current_queue_size = @seed_queue.size
+      @stats.current_coverage = @coverage_tracker.global_hits.size
+    end
+
     stats_path = File.join(@config.result_dir, 'statistics.json')
-    @stats.save(stats_path)
-    @reporter.log_success("Statistics saved to #{stats_path}")
+    tmp_path = stats_path + '.tmp'
+
+    # Save to tmp then move to ensure we don't end up with half-written file
+    # if killed mid-write
+    begin
+      @stats.save(tmp_path)
+      FileUtils.mv(tmp_path, stats_path)
+    rescue StandardError => e
+      log_error("Failed to save stats snapshot: #{e.message}")
+    end
+  end
+
+  def shutdown_stats
+    log_warn('Shutting down. Saving final statistics...')
+    save_stats_snapshot
+    log_success('Statistics saved.')
   end
 
   # ---------------------------------------------------------
@@ -238,23 +629,49 @@ class CampaignController
   def minimizer_worker_loop(id, pipe_in, pipe_out)
     $0 = "fuzzer_worker_#{id}" # for better btop :)
 
+    # TASK 3: SETUP WORKER-SPECIFIC SHM IF NEEDED
+    # ELSE MINIMIZER RUNS WILL CLASH WITH FUZZER RUNS
+    # AND OTHER MINIMIZERS
+    worker_runner = @runner
+    worker_shm_path = nil
+
+    if @shm_config
+      worker_shm_path = "/dev/shm/apt_shm_worker_#{id}_#{$$}"
+      create_shm_file(worker_shm_path, @shm_config[:size])
+      at_exit do
+        File.unlink(worker_shm_path)
+      rescue StandardError
+        nil
+      end
+
+      worker_runner = Runner::ExternalRunner.new(
+        target_path: @target_bin,
+        mode: @config.input_mode,
+        run_timeout_ms: RUN_TIMEOUT_MS,
+        shm_config: { path: worker_shm_path, size: @shm_config[:size] }
+      )
+    end
+
     loop do
       # Blocking read - wait for work
-      item = IPC::Protocol.read(pipe_in)
-      break if item.nil? # Parent closed pipe
+      item = read_ipc_message(pipe_in)
+      break if item.nil?
+
+      # Parent closed pipe
 
       input, result, classification = item
 
-      # Perform Minimization
-      process_failure_in_worker(id, pipe_out, input, result, classification)
+      # Perform Minimization with worker_runner
+      process_failure_in_worker(id, pipe_out, input, result, classification, worker_runner)
     rescue StandardError => e
       # Print to stderr to avoid messing up parent's pipe logic
       warn "[Worker #{id}] Error: #{e.message}"
     end
   end
 
-  def process_failure_in_worker(id, pipe_out, input, result, classification)
-    @reporter.log_info("Worker #{id} minimizing: #{classification.signature.cyan}")
+  # TASK 3: specify runner now
+  def process_failure_in_worker(id, pipe_out, input, result, classification, runner)
+    log_info("Worker #{id} minimizing: #{classification.signature.cyan}")
 
     original_size = input.bytes.size
     final_input = input.bytes
@@ -263,7 +680,7 @@ class CampaignController
 
     if @config.minimize_enabled?
       # create a custom observer that can talk back to parent over pipe
-      observer = create_ipc_bug_observer(classification.signature, pipe_out)
+      observer = create_ipc_bug_observer(classification.signature, pipe_out, runner)
 
       min_result = Minimizer::Ddmin.run(
         input_bytes: input.bytes,
@@ -271,7 +688,7 @@ class CampaignController
       )
 
       final_input = min_result.minimized_input
-      final_result = @runner.run(final_input)
+      final_result = runner.run(final_input)
     end
 
     # Send success event back to parent
@@ -283,12 +700,13 @@ class CampaignController
       original_size: original_size,
       min_stats: min_result
     }
-    IPC::Protocol.send(pipe_out, event)
+    send_ipc_message(pipe_out, event)
   end
 
-  def create_ipc_bug_observer(original_sig, pipe_out)
+  # TASK 3: specify runner now
+  def create_ipc_bug_observer(original_sig, pipe_out, runner)
     lambda do |bytes|
-      run_result = @runner.run(bytes)
+      run_result = runner.run(bytes)
       classification = @oracle.classify(run_result, nil)
 
       is_original = (classification.signature == original_sig)
@@ -302,15 +720,46 @@ class CampaignController
           run_result: run_result,
           classification: classification
         }
-        IPC::Protocol.send(pipe_out, event)
+        send_ipc_message(pipe_out, event)
       end
 
       is_original
     end
   end
 
+  # ---------------------------------------------------------
+  # IPC Helpers (Marshal + Length Prefix)
+  # ---------------------------------------------------------
+
+  def send_ipc_message(io, obj)
+    payload = Marshal.dump(obj)
+    # Write 4-byte length header, then payload
+    header = [payload.bytesize].pack('L')
+    io.write(header)
+    io.write(payload)
+  end
+
+  def read_ipc_message(io)
+    # Read 4-byte length header
+    # read(N) returns nil if EOF
+    header = io.read(4)
+    return nil unless header
+
+    size = header.unpack1('L')
+    payload = io.read(size)
+    return nil unless payload
+
+    Marshal.load(payload)
+  rescue EOFError
+    nil
+  end
+
+  # ---------------------------------------------------------
+  # Logging / Helpers
+  # ---------------------------------------------------------
+
   def setup_signal_traps
-    @reporter.log_info('Setting up signal traps (Ctrl+C to stop)...')
+    log_info('Setting up signal traps (Ctrl+C to stop)...')
     # We raise Interrupt to break the main loop.
     # The 'ensure' block in the run method will catch this
     # and call 'stop' in a safe thread context.
@@ -324,15 +773,66 @@ class CampaignController
     graceful_exit_delay = @hard_timeout.to_i - 10
     return if graceful_exit_delay <= 0
 
-    @reporter.log_info("Campaign TIMEOUT set. Graceful stop in #{graceful_exit_delay}s.")
+    log_info("Campaign TIMEOUT set. Graceful stop in #{graceful_exit_delay}s.")
 
     Thread.new do
       sleep graceful_exit_delay
       if @running
-        @reporter.log_warn('TIMEOUT approaching. Wrapping things up ...')
+        log_warn('TIMEOUT approaching. Wrapping things up ...')
         stop
       end
     end
+  end
+
+  def log_startup
+    puts '--- Fuzzer Starting (Multi-Process Mode) ---'.bold
+    puts "  Target:    #{@config.fuzzed_program.light_blue}"
+    puts "  Mode:      #{@config.fuzzer_type.to_s.upcase.light_magenta}"
+    if @greybox_mode
+      puts "  Schedule:  #{@config.power_schedule.to_s.cyan}"
+      puts "  Queue Dir: #{File.join(@config.result_dir, 'queue').light_black}"
+    end
+    puts "  Workers:   #{MINIMIZER_PROCESSES.to_s.light_blue}"
+    puts "  Minimize:  #{@config.minimize_enabled?.to_s.light_blue}"
+    puts '-----------------------'
+  end
+
+  def log_new_bug(classification)
+    puts "\n" + '--- NEW FAILURE FOUND! ---'.red.bold
+    puts "  Oracle:    #{classification.oracle.to_s.red}"
+    puts "  Signature: #{classification.signature.red}"
+    puts "  Status:    #{'Queued for minimization.'.yellow}"
+    puts '-----------------------' + "\n"
+  end
+
+  def log_new_bug_during_min(classification)
+    puts '  -> Discovered new bug during minimization!'.magenta
+    puts "     Signature: #{classification.signature.magenta}"
+    puts '     Sent to queue.'.magenta
+  end
+
+  def log_minimization_done(classification, old_size, new_size)
+    puts '--- Minimization Complete ---'.green
+    puts "  Signature: #{classification.signature.cyan}"
+    puts "  Size:      #{old_size} bytes -> #{new_size} bytes".green
+    puts '  Report saved.'.green
+    puts '-----------------------------'
+  end
+
+  def log_info(msg)
+    puts "[INFO] #{msg}".light_black
+  end
+
+  def log_warn(msg)
+    puts "[WARN] #{msg}".yellow
+  end
+
+  def log_error(msg)
+    puts "[ERROR] #{msg}".red
+  end
+
+  def log_success(msg)
+    puts "[OK] #{msg}".green
   end
 end
 

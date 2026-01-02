@@ -1,0 +1,16 @@
+{
+  "input": "H!)PQQdS",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 139,
+    "kind": "heap"
+  },
+  "coverage": 23,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 3188,
+    "nb_steps": 56,
+    "execution_time": 930
+  }
+}

@@ -2,8 +2,12 @@
 
 source 'https://rubygems.org'
 
-gem 'colorize'
+# gem "rails"
 
+gem 'aruba'
+gem 'colorize'
+gem 'prop_check'
+gem 'pry'
 gem 'rspec'
 gem 'rubocop'
 gem 'ruby_tree_sitter', '~> 2.0'

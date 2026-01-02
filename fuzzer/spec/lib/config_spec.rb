@@ -43,7 +43,8 @@ describe 'Config' do
             'FUZZED_PROG' => prog_path,
             'RESULT_FUZZ' => result_dir,
             'INPUT' => 'file',
-            'MINIMIZE' => '1'
+            'MINIMIZE' => '1',
+            'FUZZER' => 'blackbox'
           }
           load_config_with_env(mock_env)
 
@@ -53,6 +54,7 @@ describe 'Config' do
           expect(Config.input_mode).to eq(:file)
           expect(Config.minimize_enabled?).to be(true)
           expect(Config.fuzzer_name).not_to be_empty
+          expect(Config.fuzzer_type).to be(:blackbox)
         end
       end
     end
@@ -66,13 +68,17 @@ describe 'Config' do
             'FUZZED_PROG' => prog_path, # no default
             'RESULT_FUZZ' => result_dir, # no default
             'INPUT' => nil,
-            'MINIMIZE' => nil
+            'MINIMIZE' => nil,
+            'FUZZER' => 'SECRET_FUZZER_MODE',
+            'POWER_SCHEDULE' => 'SUPER_DUPER_ULTRA_FAST'
           }
           load_config_with_env(mock_env)
 
           expect { Config.validate! }.not_to raise_error
           expect(Config.input_mode).to eq(:stdin) # Default
           expect(Config.minimize_enabled?).to be(true) # Default
+          expect(Config.fuzzer_type).to be(:greybox)
+          expect(Config.power_schedule).to be(:simple)
         end
       end
     end
@@ -112,7 +118,7 @@ describe 'Config' do
           'RESULT_FUZZ' => result_dir
         }
         load_config_with_env(mock_env)
-        expect { Config.validate! }.to raise_error(/not found or not executable/)
+        expect { Config.validate! }.to raise_error("ERROR: FUZZED_PROG '/tmp/not/a/real/file' not found.")
       end
     end
 

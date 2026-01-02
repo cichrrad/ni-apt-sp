@@ -1,0 +1,16 @@
+{
+  "input": "S2as",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 150,
+    "kind": "heap"
+  },
+  "coverage": 23,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 3919,
+    "nb_steps": 32,
+    "execution_time": 699
+  }
+}

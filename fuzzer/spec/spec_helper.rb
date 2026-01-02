@@ -7,7 +7,6 @@ require 'simplecov'
 SimpleCov.start do
   # Ignores
   add_filter '/spec/'
-  enable_coverage :branch
 end
 
 # Fuzzer parts

@@ -1,0 +1,16 @@
+{
+  "input": "oL%S",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 129,
+    "kind": "stack"
+  },
+  "coverage": 23,
+  "execution_time": 40,
+  "minimization": {
+    "unminimized_size": 82,
+    "nb_steps": 28,
+    "execution_time": 481
+  }
+}

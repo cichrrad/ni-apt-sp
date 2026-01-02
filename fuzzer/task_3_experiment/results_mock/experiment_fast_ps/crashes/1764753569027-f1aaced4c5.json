@@ -1,0 +1,16 @@
+{
+  "input": "HMf/hQ#_",
+  "oracle": "asan",
+  "bug_info": {
+    "file": "mock.c",
+    "line": 139,
+    "kind": "heap"
+  },
+  "coverage": 26,
+  "execution_time": 30,
+  "minimization": {
+    "unminimized_size": 3117,
+    "nb_steps": 56,
+    "execution_time": 986
+  }
+}

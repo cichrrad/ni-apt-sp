@@ -1,0 +1,26 @@
+{
+  "fuzzer_name": "fuzzy_wuzzy_39901",
+  "fuzzed_program": "target_programs/greybox_test/",
+  "nb_runs": 4863,
+  "nb_failed_runs": 1780,
+  "nb_hanged_runs": 191,
+  "nb_queued_seeds": 15,
+  "coverage": 33,
+  "execution_time": {
+    "average": 60.829323462882996,
+    "median": 10.0,
+    "min": 10,
+    "max": 1060
+  },
+  "nb_unique_failures": 7,
+  "minimization": {
+    "before": 7,
+    "avg_steps": 164,
+    "execution_time": {
+      "average": 10044.142857142857,
+      "median": 735.0,
+      "min": 272,
+      "max": 55482
+    }
+  }
+}

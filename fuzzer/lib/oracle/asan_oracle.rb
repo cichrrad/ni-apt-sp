@@ -8,14 +8,14 @@ module Oracle
     # ASAN src files, not
     # target binary
 
-    KIND_REGEX = /AddressSanitizer: (stack|heap)-buffer-overflow/.freeze
+    KIND_REGEX = /AddressSanitizer: (global|stack|heap)-buffer-overflow/.freeze
     FRAME_REGEX = /^\s*#\d+.*\s+([^\s]+):(\d+)/.freeze
 
     def check(run_result, _fuzz_input)
       stderr = run_result.stderr
       return nil if stderr.nil? || stderr.empty?
 
-      # decide heap/stack
+      # decide heap/stack/global
       kind_match = KIND_REGEX.match(stderr)
       return nil unless kind_match
 

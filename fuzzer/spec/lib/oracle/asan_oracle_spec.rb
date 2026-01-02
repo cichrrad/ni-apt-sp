@@ -99,4 +99,36 @@ describe Oracle::ASANOracle do
       expect(oracle.check(result, empty_input)).to be_nil
     end
   end
+
+  context 'when detecting global-buffer-overflow' do
+    let(:stderr) do
+      <<~ERR
+        =================================================================
+        ==12345==ERROR: AddressSanitizer: global-buffer-overflow on address 0x55dc...
+        READ of size 4 at 0x55dc... thread T0
+            #0 0x7f... in main /path/to/global_overfl.c:15
+            #1 0x7f... in __libc_start_main
+      ERR
+    end
+    let(:result) { fake_result(stderr: stderr, exit_code: 1) }
+
+    it 'detects the crash' do
+      classification = oracle.check(result, empty_input)
+      expect(classification).not_to be_nil
+      expect(classification.status).to eq(:fail)
+      expect(classification.oracle).to eq(:asan)
+    end
+
+    it 'extracts the correct bug_info' do
+      info = oracle.check(result, empty_input).bug_info
+      expect(info[:kind]).to eq(:global)
+      expect(info[:file]).to eq('global_overfl.c')
+      expect(info[:line]).to eq(15)
+    end
+
+    it 'generates the correct signature' do
+      sig = oracle.check(result, empty_input).signature
+      expect(sig).to eq('asan:global:global_overfl.c:15')
+    end
+  end
 end
