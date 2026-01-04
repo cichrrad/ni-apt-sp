@@ -1,3 +1,6 @@
+
+![fuzzer_demo](./fuzzer-demo.gif)
+
 # NI-RUB Semestal project -- Random fuzzer
 
 ## Requirements
